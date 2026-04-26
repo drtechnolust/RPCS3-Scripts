@@ -1,24 +1,64 @@
 #Requires -Version 7.0
 <#
-.SYNOPSIS
-    RPCS3 Batch PKG Installer — PowerShell 7 edition
-.DESCRIPTION
-    Extracts ZIPs containing PS3 PKG/RAP files, installs them via RPCS3,
-    tracks state by SHA-256 hash, organises archives, and auto-unchecks cache options.
-    Successfully installed folders (DIR mode) are moved to _Installed just like ZIPs.
-.PARAMETER SourceRoot
-    Folder containing the source ZIP archives / PKG folders.
-.PARAMETER Rpcs3Exe
-    Full path to rpcs3.exe.
-.PARAMETER Rpcs3Root
-    Root folder of the RPCS3 installation (contains dev_hdd0).
-.PARAMETER TempRoot
-    Scratch folder used for ZIP extraction (cleaned up after each archive).
-.PARAMETER SevenZipExe
-    Path to 7z.exe.
-.PARAMETER FolderPollSeconds
-    How long (seconds) to keep polling for a new game folder after each PKG install.
+===============================================================================
+  SCRIPT   : RPCS3-Batch-Installer.ps1
+  AUTHOR   : Paul Mardis
+  CREATED  : 2025
+  VERSION  : 1.0
+  GITHUB   : https://github.com/drtechnolust/RPCS3-Scripts
+
+===============================================================================
+  COPYRIGHT & LICENSE
+===============================================================================
+  Copyright (c) 2025 Paul Mardis. All rights reserved.
+
+  This script is the original work of Paul Mardis and is provided for
+  personal, non-commercial use only.
+
+  You MAY:
+    - Use this script for your own personal PS3/RPCS3 setup
+    - Share it with others provided this full header remains intact and
+      credit is clearly given to the original author: Paul Mardis
+
+  You MAY NOT:
+    - Remove or alter this copyright notice or author attribution
+    - Redistribute this script as your own work
+    - Include this script in paid tools, packages, or products without
+      explicit written permission from Paul Mardis
+    - Claim authorship or creation of this script
+
+  If you share or repost this script anywhere (GitHub, Reddit, forums,
+  YouTube descriptions, Discord, etc.) you MUST credit:
+    Paul Mardis — https://github.com/drtechnolust
+
+===============================================================================
+  DESCRIPTION
+===============================================================================
+  A fully automated PS3 PKG batch installer for RPCS3 (PowerShell 7+).
+  Processes ZIP archives and loose folders containing PS3 PKG/RAP files,
+  installs them via RPCS3, tracks installation state by SHA-256 hash,
+  organises archives into _Installed/_Failed folders, and auto-handles
+  RPCS3 UI dialogs so the entire process runs hands-free.
+
+  Features:
+    - Supports ZIPs and loose PKG folders as input sources
+    - Four run modes: Normal, Dry Run, Force Reinstall, Retry Failed
+    - SHA-256 state tracking prevents duplicate installs across sessions
+    - Automated UI interaction via Windows UI Automation (no SendKeys hacks)
+    - Auto-cancels the Loading games dialog to speed up installs
+    - Auto-unchecks Precompile caches checkbox for faster processing
+    - Auto-clicks Install and OK buttons without user intervention
+    - Matches RAP license files to their PKG and copies them to RPCS3 exdata
+    - Moves processed archives to _Installed or _Failed automatically
+    - Full CSV log with timestamps, paths, exit codes, and detected game folders
+    - Batch limit support to process a defined number of items per run
+    - Pre-flight checks for RPCS3, 7-Zip, and game folder existence
+    - Detects and optionally kills existing RPCS3 instances before running
+  Designed for use with LaunchBox + RPCS3 on Windows.
+
+===============================================================================
 #>
+
 param(
     [string] $SourceRoot        = 'D:\Arcade\System roms\Sony Playstation 3\Sony - PlayStation 3 (PSN) (Content)',
     [string] $Rpcs3Exe          = 'C:\Arcade\LaunchBox\Emulators\RPCS3\rpcs3.exe',

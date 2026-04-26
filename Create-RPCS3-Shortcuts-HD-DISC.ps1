@@ -1,32 +1,60 @@
-﻿<#
-.SYNOPSIS
-    Create-RPCS3-Shortcuts.ps1
+<#
+===============================================================================
+  SCRIPT   : Create-RPCS3-Shortcuts-HD-DISC.ps1
+  AUTHOR   : Paul Mardis
+  CREATED  : 2025
+  VERSION  : 1.0
+  GITHUB   : https://github.com/drtechnolust/RPCS3-Scripts
 
-.DESCRIPTION
-    Scans both PS3 game library folders and automatically creates or updates Windows
-    shortcuts (.lnk files) for each valid game, pointing to RPCS3 with the --no-gui
-    flag for direct launch.
+===============================================================================
+  COPYRIGHT & LICENSE
+===============================================================================
+  Copyright (c) 2025 Paul Mardis. All rights reserved.
 
-    Handles two distinct PS3 library structures in a single run:
+  This script is the original work of Paul Mardis and is provided for
+  personal, non-commercial use only.
 
-    HD/PSN Games (dev_hdd0\game):
-      - Folders named by Title ID (e.g. BLES00403, NPEA00092)
-      - PARAM.SFO located in the game root folder
-      - EBOOT.BIN located in USRDIR subfolder
-      - Region derived from Title ID prefix (BLES=EU, BLUS=US, BLJM=JP, etc.)
-      - Non-game folders (DATA, INSTALL, cache) are automatically skipped
+  You MAY:
+    - Use this script for your own personal PS3/RPCS3 setup
+    - Share it with others provided this full header remains intact and
+      credit is clearly given to the original author: Paul Mardis
 
-    Disc Games (dev_hdd0\disc):
-      - Folders named with human-readable titles and region in brackets
-        e.g. LittleBigPlanet_(USA), Macross_Last_Frontier_(Japan)
-      - PARAM.SFO located in the PS3_GAME subfolder
-      - EBOOT.BIN located in PS3_GAME\USRDIR subfolder
-      - Region derived from folder name suffix (USA, Japan, Europe, etc.)
+  You MAY NOT:
+    - Remove or alter this copyright notice or author attribution
+    - Redistribute this script as your own work
+    - Include this script in paid tools, packages, or products without
+      explicit written permission from Paul Mardis
+    - Claim authorship or creation of this script
 
-    Both libraries share the same output shortcut folder and de-duplication tracker,
-    so no duplicate shortcuts are created across the two sources. Includes a dry run
-    mode to preview all changes before committing them.
+  If you share or repost this script anywhere (GitHub, Reddit, forums,
+  YouTube descriptions, Discord, etc.) you MUST credit:
+    Paul Mardis — https://github.com/drtechnolust
+
+===============================================================================
+  DESCRIPTION
+===============================================================================
+  Scans BOTH PS3 game library folders in a single run and automatically creates
+  or updates Windows shortcuts (.lnk files) for each valid game, pointing to
+  RPCS3 with the --no-gui flag for seamless direct launch.
+
+  Handles two distinct PS3 library structures:
+    HD/PSN Games  (dev_hdd0\game) — Title ID named folders, PARAM.SFO in root
+    Disc Games    (dev_hdd0\disc) — Human-readable folders, PARAM.SFO in PS3_GAME
+
+  Features:
+    - Two-pass scan: processes HD/PSN games then Disc games in one run
+    - Parses PARAM.SFO binary metadata for accurate game titles
+    - Derives region tags from Title ID prefixes (HD) and folder names (Disc)
+    - Shared de-duplication tracker prevents duplicate shortcuts across both sources
+    - Unicode-safe shortcut writing via temp-file workaround for WScript.Shell
+    - Skips non-game folders (DATA, INSTALL, cache, hidden)
+    - Dry run mode to safely preview all changes before committing
+    - Detailed per-library issue tracking in summary report
+  Designed for use with LaunchBox + RPCS3 on Windows.
+
+===============================================================================
 #>
+
 param(
     # HD/PSN games folder (Title ID named folders)
     [string]$HdGamePath   = "D:\Arcade\System roms\Sony Playstation 3\dev_hdd0\game",

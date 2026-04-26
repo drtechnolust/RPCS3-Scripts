@@ -1,14 +1,52 @@
-﻿<#
-.SYNOPSIS
-    Create-RPCS3-Shortcuts.ps1
+<#
+===============================================================================
+  SCRIPT   : Create-RPCS3-Shortcuts.ps1
+  AUTHOR   : Paul Mardis
+  CREATED  : 2025
+  VERSION  : 1.0
+  GITHUB   : https://github.com/drtechnolust/RPCS3-Scripts
 
-.DESCRIPTION
-    Scans a PS3 game library folder (dev_hdd0\game) and automatically creates or updates
-    Windows shortcuts (.lnk files) for each valid game, pointing to RPCS3 with the --no-gui
-    flag for direct launch. Reads each game's PARAM.SFO binary metadata to extract the proper
-    title and derives a region tag (US/EU/JP/AS/KR) from the Title ID prefix. Skips non-game
-    folders (DATA, INSTALL, cache), logs missing PARAM.SFO and EBOOT.BIN, and includes a dry
-    run mode to preview all changes before committing them.
+===============================================================================
+  COPYRIGHT & LICENSE
+===============================================================================
+  Copyright (c) 2025 Paul Mardis. All rights reserved.
+
+  This script is the original work of Paul Mardis and is provided for
+  personal, non-commercial use only.
+
+  You MAY:
+    - Use this script for your own personal PS3/RPCS3 setup
+    - Share it with others provided this full header remains intact and
+      credit is clearly given to the original author: Paul Mardis
+
+  You MAY NOT:
+    - Remove or alter this copyright notice or author attribution
+    - Redistribute this script as your own work
+    - Include this script in paid tools, packages, or products without
+      explicit written permission from Paul Mardis
+    - Claim authorship or creation of this script
+
+  If you share or repost this script anywhere (GitHub, Reddit, forums,
+  YouTube descriptions, Discord, etc.) you MUST credit:
+    Paul Mardis — https://github.com/drtechnolust
+
+===============================================================================
+  DESCRIPTION
+===============================================================================
+  Scans a PS3 game library folder (dev_hdd0\game) and automatically creates
+or updates Windows shortcuts (.lnk files) for each valid PS3 game, pointing
+to RPCS3 with the --no-gui flag for seamless direct launch.
+
+  Features:
+    - Parses PARAM.SFO binary metadata to extract proper game titles
+    - Derives region tags (US/EU/JP/AS/KR) from PS3 Title ID prefixes
+    - Skips non-game folders (DATA, INSTALL, cache, hidden folders)
+    - Logs all missing PARAM.SFO and EBOOT.BIN files for easy debugging
+    - Dry run mode to safely preview all changes before committing
+    - Automatically de-duplicates shortcut names
+  Designed for use with LaunchBox + RPCS3 on Windows.
+
+===============================================================================
 #>
 
 param(
