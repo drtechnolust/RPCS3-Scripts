@@ -1,0 +1,1 @@
+﻿Get-ChildItem -Path "C:\Arcade\COMMUNITY Theme Creator 3.3.3 - Early Access\My Theme Projects\CoinOps Mega Theme\Media\Arcade Vertical Cabinets Night" -File | Select-Object -ExpandProperty Name
