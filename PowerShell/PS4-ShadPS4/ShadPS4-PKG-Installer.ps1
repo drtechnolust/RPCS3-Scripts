@@ -1,47 +1,88 @@
-﻿#requires -version 5.1
+#Requires -Version 5.1
 <#
-ShadPS4Plus / pkg_extractor.exe Bulk Installer
+.SYNOPSIS
+    Bulk installs PS4 PKG files using pkg_extractor.exe with single-type or mixed-mode routing.
 
-Two modes:
-  1. Single-type  - You declare the type (Game / Patch / DLC).
-                    No --check-type call. Fast.
-                    Use when your source folder contains one type only.
+.DESCRIPTION
+    Processes a folder of PS4 PKG files and extracts them to the correct destination
+    using pkg_extractor.exe. Supports two modes:
 
-  2. Mixed folder - Runs --check-type on every PKG to detect type.
-                    Routes Games/Patches -> GamesDir
-                          DLC           -> DLCDir
-                    Use when your source folder contains mixed types.
+      Single-type  -- You declare the type (Game / Patch / DLC). No --check-type call.
+                      Fastest. Use when your source folder contains one type only.
 
-In both modes the extractor handles subfolder naming:
-  Game  -> GamesDir\CUSA#####
-  Patch -> GamesDir\CUSA#####-patch
-  DLC   -> DLCDir\CUSA#####\ContentID
+      Mixed folder -- Runs --check-type on every PKG to detect type automatically.
+                      Routes Games and Patches to GamesDir, DLC to DLCDir.
+                      Use when your source folder contains mixed types.
 
-Notes:
-  - Designed for PowerShell ISE (no Windows Forms dialogs)
-  - All paths typed/pasted at console prompts
-  - Strips surrounding quotes from pasted paths
-  - Incremental CSV log written per-file (survives Ctrl+C)
-  - Successfully extracted PKGs moved to _Completed subfolder
+    In both modes the extractor handles subfolder naming:
+      Game  -> GamesDir\CUSA#####
+      Patch -> GamesDir\CUSA#####-patch
+      DLC   -> DLCDir\CUSA#####\ContentID
+
+    Features:
+      - Interactive prompts for all paths (ISE and terminal compatible)
+      - Dry run option previews extraction without writing anything
+      - Incremental CSV log written after each file (survives Ctrl+C)
+      - Text log with full stdout/stderr from extractor
+      - Successfully extracted PKGs moved to _Completed subfolder
+      - Progress bar shown after each file
+
+.NOTES
+    Requires: pkg_extractor.exe (ShadPS4Plus tool)
+    Pre-fill $DefaultExtractorPath in the CONFIG block to skip the extractor prompt.
+
+.EXAMPLE
+    .\ShadPS4-PKG-Installer.ps1
+
+.VERSION
+    2.0.0 - MIT header, config block for common defaults, removed box-drawing
+            characters from banner, ISE-compatible exit pattern. All logic preserved.
+    1.1.0 - Added mixed-mode type detection via --check-type.
+    1.0.0 - Initial release (single-type mode only).
+
+.LICENSE
+    MIT License
+    Copyright (c) Paul Mardis
 #>
 
-# ---------------------------------------------------------------------------
-# Console input helpers
-# ---------------------------------------------------------------------------
+# ==============================================================================
+# CONFIG -- Pre-fill these to skip repeated prompts. Leave blank to be prompted.
+# ==============================================================================
+$DefaultSourceFolder   = ""    # e.g. "D:\Arcade\System roms\Sony Playstation 4\Downloading PS4\Games"
+$DefaultGamesDir       = "D:\Arcade\System roms\Sony Playstation 4\Official PS4 Games"
+$DefaultDLCDir         = ""    # e.g. "D:\Arcade\System roms\Sony Playstation 4\DLC"
+$DefaultExtractorPath  = ""    # e.g. "C:\Tools\pkg_extractor.exe"
+# ==============================================================================
 
+function Set-ExitCode {
+    param([int]$Code)
+    $global:LASTEXITCODE = $Code
+}
+
+# ------------------------------------------------------------------------------
+# Console input helpers
+# ------------------------------------------------------------------------------
 function Read-FolderPath {
-    param([string]$Prompt)
+    param([string]$Prompt, [string]$Default = "")
+
+    if (-not [string]::IsNullOrWhiteSpace($Default)) {
+        if (Test-Path -LiteralPath $Default -PathType Container) {
+            Write-Host "  Using default: $Default" -ForegroundColor DarkGreen
+            return $Default
+        }
+        Write-Host "  Default path not found ($Default) -- please enter manually." -ForegroundColor Yellow
+    }
+
     while ($true) {
         Write-Host "  $Prompt" -ForegroundColor DarkCyan
         $raw = Read-Host "  Folder path"
         $p   = $raw.Trim().Trim('"').Trim("'")
         if ([string]::IsNullOrWhiteSpace($p)) {
-            Write-Host "  Path cannot be empty. Please try again." -ForegroundColor Yellow
+            Write-Host "  Path cannot be empty." -ForegroundColor Yellow
             continue
         }
         if (-not (Test-Path -LiteralPath $p -PathType Container)) {
             Write-Host "  Folder not found: $p" -ForegroundColor Yellow
-            Write-Host "  Please check the path and try again." -ForegroundColor Yellow
             continue
         }
         return $p
@@ -49,18 +90,26 @@ function Read-FolderPath {
 }
 
 function Read-FilePath {
-    param([string]$Prompt)
+    param([string]$Prompt, [string]$Default = "")
+
+    if (-not [string]::IsNullOrWhiteSpace($Default)) {
+        if (Test-Path -LiteralPath $Default -PathType Leaf) {
+            Write-Host "  Using default: $Default" -ForegroundColor DarkGreen
+            return $Default
+        }
+        Write-Host "  Default path not found ($Default) -- please enter manually." -ForegroundColor Yellow
+    }
+
     while ($true) {
         Write-Host "  $Prompt" -ForegroundColor DarkCyan
         $raw = Read-Host "  File path"
         $p   = $raw.Trim().Trim('"').Trim("'")
         if ([string]::IsNullOrWhiteSpace($p)) {
-            Write-Host "  Path cannot be empty. Please try again." -ForegroundColor Yellow
+            Write-Host "  Path cannot be empty." -ForegroundColor Yellow
             continue
         }
         if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
             Write-Host "  File not found: $p" -ForegroundColor Yellow
-            Write-Host "  Please check the path and try again." -ForegroundColor Yellow
             continue
         }
         return $p
@@ -70,8 +119,8 @@ function Read-FilePath {
 function Read-Mode {
     while ($true) {
         Write-Host "  Select mode:" -ForegroundColor DarkCyan
-        Write-Host "    1 = Single-type folder  (all PKGs are the same type - no auto-detect)" -ForegroundColor White
-        Write-Host "    2 = Mixed folder         (mixed types - uses --check-type to route each PKG)" -ForegroundColor White
+        Write-Host "    1 = Single-type  (all PKGs are the same type, no auto-detect)" -ForegroundColor White
+        Write-Host "    2 = Mixed folder (mixed types, uses --check-type to route each PKG)" -ForegroundColor White
         $answer = Read-Host "  Enter 1 or 2"
         switch ($answer.Trim()) {
             '1' { return 'Single' }
@@ -97,7 +146,7 @@ function Read-PkgType {
     }
 }
 
-function Ask-YesNo {
+function Invoke-YesNo {
     param([string]$Prompt, [bool]$Default = $true)
     $defaultText = if ($Default) { "Y/n" } else { "y/N" }
     while ($true) {
@@ -111,11 +160,10 @@ function Ask-YesNo {
     }
 }
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # Filesystem helpers
-# ---------------------------------------------------------------------------
-
-function Ensure-Folder {
+# ------------------------------------------------------------------------------
+function Confirm-Folder {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
@@ -139,7 +187,7 @@ function Write-CsvRow {
 
 function Move-ToCompleted {
     param([string]$FilePath, [string]$CompletedFolder)
-    Ensure-Folder -Path $CompletedFolder
+    Confirm-Folder -Path $CompletedFolder
     $name = [IO.Path]::GetFileName($FilePath)
     $dest = Join-Path $CompletedFolder $name
     if (Test-Path -LiteralPath $dest) {
@@ -151,14 +199,13 @@ function Move-ToCompleted {
     return $dest
 }
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # External process runner
-# ---------------------------------------------------------------------------
-
+# ------------------------------------------------------------------------------
 function Invoke-External {
     param(
-        [Parameter(Mandatory)][string]$ExePath,
-        [Parameter(Mandatory)][string[]]$Arguments,
+        [string]$ExePath,
+        [string[]]$Arguments,
         [string]$WorkingDirectory = (Split-Path -Path $ExePath -Parent)
     )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -177,7 +224,7 @@ function Invoke-External {
     $stderr = $proc.StandardError.ReadToEnd()
     $proc.WaitForExit()
 
-    return [pscustomobject]@{
+    return [PSCustomObject]@{
         ExitCode = $proc.ExitCode
         StdOut   = $stdout
         StdErr   = $stderr
@@ -194,10 +241,9 @@ function Get-PkgTypeName {
     }
 }
 
-# ---------------------------------------------------------------------------
-# Progress bar
-# ---------------------------------------------------------------------------
-
+# ------------------------------------------------------------------------------
+# Progress bar (ASCII only)
+# ------------------------------------------------------------------------------
 function Write-ProgressBar {
     param([int]$Current, [int]$Total, [int]$Success, [int]$Errors, [int]$Skipped, [int]$BarWidth = 40)
     if ($Total -eq 0) { return }
@@ -205,56 +251,44 @@ function Write-ProgressBar {
     $filled = [int][math]::Round(($Current / $Total) * $BarWidth, 0)
     $empty  = $BarWidth - $filled
     $bar    = ('#' * $filled) + ('-' * $empty)
-    Write-Host "  [$bar] $pct% ($Current/$Total)  OK:$Success  ERR:$Errors  SKIP:$Skipped" -ForegroundColor Cyan
+    Write-Host ("  [{0}] {1}% ({2}/{3})  OK:{4}  ERR:{5}  SKIP:{6}" -f $bar, $pct, $Current, $Total, $Success, $Errors, $Skipped) -ForegroundColor Cyan
 }
 
-# ---------------------------------------------------------------------------
-# Banner
-# ---------------------------------------------------------------------------
-
+# ==============================================================================
+# BANNER
+# ==============================================================================
 Write-Host ""
 Write-Host "================================================" -ForegroundColor Cyan
-Write-Host "  ShadPS4 Bulk PKG Installer                   " -ForegroundColor Cyan
+Write-Host "  ShadPS4 Bulk PKG Installer" -ForegroundColor Cyan
 Write-Host "================================================" -ForegroundColor Cyan
 Write-Host ""
 
-# ---------------------------------------------------------------------------
-# Mode selection
-# ---------------------------------------------------------------------------
-
+# ==============================================================================
+# INTERACTIVE SETUP
+# ==============================================================================
 Write-Host "--- MODE ---" -ForegroundColor White
 $mode = Read-Mode
 Write-Host "  Mode : $mode" -ForegroundColor DarkGreen
 
-# ---------------------------------------------------------------------------
-# Source folder
-# ---------------------------------------------------------------------------
-
 Write-Host ""
 Write-Host "--- SOURCE FOLDER ---" -ForegroundColor White
-$sourceFolder = Read-FolderPath -Prompt "Enter the folder path containing your PKG files"
+$sourceFolder = Read-FolderPath -Prompt "Enter the folder path containing your PKG files" `
+                                -Default $DefaultSourceFolder
 Write-Host "  Source : $sourceFolder" -ForegroundColor DarkGreen
-
-# ---------------------------------------------------------------------------
-# Extractor
-# ---------------------------------------------------------------------------
 
 Write-Host ""
 Write-Host "--- PKG_EXTRACTOR.EXE ---" -ForegroundColor White
-$extractorPath = Read-FilePath -Prompt "Enter the full path to pkg_extractor.exe"
+$extractorPath = Read-FilePath -Prompt "Enter the full path to pkg_extractor.exe" `
+                               -Default $DefaultExtractorPath
 Write-Host "  Extractor : $extractorPath" -ForegroundColor DarkGreen
 
-# ---------------------------------------------------------------------------
-# Destination(s) - Single needs one folder, Mixed needs GamesDir + DLCDir
-# ---------------------------------------------------------------------------
-
-$pkgType    = $null   # Single mode only
-$destFolder = $null   # Single mode only
-$gamesDir   = $null   # Mixed mode only
-$dlcDir     = $null   # Mixed mode only
+# Destination(s)
+$pkgType    = $null
+$destFolder = $null
+$gamesDir   = $null
+$dlcDir     = $null
 
 if ($mode -eq 'Single') {
-
     Write-Host ""
     Write-Host "--- PKG TYPE ---" -ForegroundColor White
     $pkgType = Read-PkgType
@@ -267,46 +301,40 @@ if ($mode -eq 'Single') {
         'Patch' { "Enter your Official PS4 Games folder (extractor creates CUSA#####-patch subfolders here)" }
         'DLC'   { "Enter your DLC folder (extractor creates CUSA#####\ContentID subfolders here)" }
     }
-    $destFolder = Read-FolderPath -Prompt $destPrompt
+    $destFolder = Read-FolderPath -Prompt $destPrompt -Default $DefaultGamesDir
     Write-Host "  Destination : $destFolder" -ForegroundColor DarkGreen
-
-} else {
-
+}
+else {
     Write-Host ""
     Write-Host "--- GAMES DESTINATION ---" -ForegroundColor White
-    $gamesDir = Read-FolderPath -Prompt "Enter your Official PS4 Games folder (for Games and Patches)"
+    $gamesDir = Read-FolderPath -Prompt "Enter your Official PS4 Games folder (for Games and Patches)" `
+                                -Default $DefaultGamesDir
     Write-Host "  Games : $gamesDir" -ForegroundColor DarkGreen
 
     Write-Host ""
     Write-Host "--- DLC DESTINATION ---" -ForegroundColor White
-    $dlcDir = Read-FolderPath -Prompt "Enter your DLC folder"
+    $dlcDir = Read-FolderPath -Prompt "Enter your DLC folder" -Default $DefaultDLCDir
     Write-Host "  DLC   : $dlcDir" -ForegroundColor DarkGreen
-
 }
-
-# ---------------------------------------------------------------------------
-# Options
-# ---------------------------------------------------------------------------
 
 Write-Host ""
 Write-Host "--- OPTIONS ---" -ForegroundColor White
-$recurse = Ask-YesNo "  Search subfolders recursively?" $false
-$dryRun  = Ask-YesNo "  Dry run only (no actual extraction)?" $false
+$recurse = Invoke-YesNo "  Search subfolders recursively?" $false
+$dryRun  = Invoke-YesNo "  Dry run only (no actual extraction)?" $false
 
-# ---------------------------------------------------------------------------
-# Folder setup
-# ---------------------------------------------------------------------------
-
+# ==============================================================================
+# FOLDER SETUP
+# ==============================================================================
 $logFolder       = Join-Path $sourceFolder "_Logs"
 $completedFolder = Join-Path $sourceFolder "_Completed"
 
-Ensure-Folder -Path $logFolder
-Ensure-Folder -Path $completedFolder
+Confirm-Folder -Path $logFolder
+Confirm-Folder -Path $completedFolder
 
 $modeLabel = if ($mode -eq 'Single') { "Single_$pkgType" } else { "Mixed" }
 $stamp     = Get-Date -Format "yyyyMMdd_HHmmss"
-$csvLog    = Join-Path $logFolder "ShadPS4_${modeLabel}_$stamp.csv"
-$txtLog    = Join-Path $logFolder "ShadPS4_${modeLabel}_$stamp.txt"
+$csvLog    = Join-Path $logFolder ("ShadPS4_${modeLabel}_${stamp}.csv")
+$txtLog    = Join-Path $logFolder ("ShadPS4_${modeLabel}_${stamp}.txt")
 
 Write-LogLine -Path $txtLog -Text "Run started"
 Write-LogLine -Path $txtLog -Text "Mode      : $mode"
@@ -322,18 +350,17 @@ Write-LogLine -Path $txtLog -Text "Extractor : $extractorPath"
 Write-LogLine -Path $txtLog -Text "Recurse   : $recurse"
 Write-LogLine -Path $txtLog -Text "DryRun    : $dryRun"
 
-# ---------------------------------------------------------------------------
-# Collect PKG files
-# ---------------------------------------------------------------------------
-
-$params = @{
+# ==============================================================================
+# COLLECT PKG FILES
+# ==============================================================================
+$getParams = @{
     LiteralPath = $sourceFolder
     Filter      = "*.pkg"
     File        = $true
 }
-if ($recurse) { $params.Recurse = $true }
+if ($recurse) { $getParams.Recurse = $true }
 
-$pkgFiles = Get-ChildItem @params |
+$pkgFiles = Get-ChildItem @getParams |
     Where-Object {
         $_.FullName -notlike (Join-Path $logFolder       '*') -and
         $_.FullName -notlike (Join-Path $completedFolder '*')
@@ -344,18 +371,18 @@ if (-not $pkgFiles -or $pkgFiles.Count -eq 0) {
     Write-Host ""
     Write-Host "  No PKG files found in: $sourceFolder" -ForegroundColor Yellow
     Write-LogLine -Path $txtLog -Text "No PKG files found."
+    Set-ExitCode 0
     return
 }
 
 $total = $pkgFiles.Count
 Write-Host ""
-Write-Host "  Found $total PKG file(s) to process." -ForegroundColor Green
+Write-Host ("  Found {0} PKG file(s) to process." -f $total) -ForegroundColor Green
 Write-Host ""
 
-# ---------------------------------------------------------------------------
-# Counters
-# ---------------------------------------------------------------------------
-
+# ==============================================================================
+# COUNTERS
+# ==============================================================================
 $cSuccess = 0
 $cError   = 0
 $cSkipped = 0
@@ -363,27 +390,26 @@ $cDryRun  = 0
 $firstRow = $true
 $index    = 0
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
-
+# ==============================================================================
+# MAIN LOOP
+# ==============================================================================
 foreach ($pkg in $pkgFiles) {
     $index++
 
-    $status          = "Pending"
-    $notes           = ""
-    $installExit     = $null
-    $finalPkgPath    = $pkg.FullName
-    $detectedType    = $pkgType   # will be overwritten in Mixed mode
-    $resolvedDest    = $destFolder  # will be overwritten in Mixed mode
+    $status       = "Pending"
+    $notes        = ""
+    $installExit  = $null
+    $finalPkgPath = $pkg.FullName
+    $detectedType = $pkgType
+    $resolvedDest = $destFolder
 
     Write-Host ""
-    Write-Host "  [$index/$total] $($pkg.Name)" -ForegroundColor Cyan
-    Write-LogLine -Path $txtLog -Text "--- [$index/$total] $($pkg.FullName)"
+    Write-Host ("  [{0}/{1}] {2}" -f $index, $total, $pkg.Name) -ForegroundColor Cyan
+    Write-LogLine -Path $txtLog -Text ("--- [{0}/{1}] {2}" -f $index, $total, $pkg.FullName)
 
     try {
 
-        # --- Mixed mode: detect type first ---
+        # --- Mixed mode: detect type ---
         if ($mode -eq 'Mixed') {
             $check        = Invoke-External -ExePath $extractorPath `
                                             -Arguments @('"' + $pkg.FullName + '"', '--check-type')
@@ -402,11 +428,11 @@ foreach ($pkg in $pkgFiles) {
                 $status = "SkippedUnknown"
                 $notes  = "Extractor could not identify PKG (exit code $($check.ExitCode))"
                 $cSkipped++
-                Write-Host "    SKIPPED - $notes" -ForegroundColor Yellow
+                Write-Host ("    SKIPPED - {0}" -f $notes) -ForegroundColor Yellow
                 Write-LogLine -Path $txtLog -Text "SKIPPED: $notes"
 
-                $row = [pscustomobject]@{
-                    TimeStamp        = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                $row = [PSCustomObject]@{
+                    TimeStamp        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
                     Mode             = $mode
                     DetectedType     = $detectedType
                     FileName         = $pkg.Name
@@ -425,18 +451,17 @@ foreach ($pkg in $pkgFiles) {
                 continue
             }
 
-            # Route to correct destination
             $resolvedDest = if ($detectedType -eq 'DLC') { $dlcDir } else { $gamesDir }
-            Write-Host "    Detected : $detectedType  ->  $resolvedDest" -ForegroundColor White
+            Write-Host ("    Detected : {0}  ->  {1}" -f $detectedType, $resolvedDest) -ForegroundColor White
             Write-LogLine -Path $txtLog -Text "Detected=$detectedType | Dest=$resolvedDest"
         }
 
-        # --- Extract (or dry run) ---
+        # --- Extract or dry run ---
         if ($dryRun) {
-            $status  = "DryRun"
-            $notes   = "Would extract to: $resolvedDest"
+            $status = "DryRun"
+            $notes  = "Would extract to: $resolvedDest"
             $cDryRun++
-            Write-Host "    DRY RUN - $notes" -ForegroundColor Yellow
+            Write-Host ("    DRY RUN - {0}" -f $notes) -ForegroundColor Yellow
             Write-LogLine -Path $txtLog -Text "DRY RUN: $notes"
         }
         else {
@@ -462,14 +487,14 @@ foreach ($pkg in $pkgFiles) {
 
                 $newPath      = Move-ToCompleted -FilePath $pkg.FullName -CompletedFolder $completedFolder
                 $finalPkgPath = $newPath
-                Write-Host "    Moved to : $newPath" -ForegroundColor DarkGreen
+                Write-Host ("    Moved to : {0}" -f $newPath) -ForegroundColor DarkGreen
                 Write-LogLine -Path $txtLog -Text "Moved to: $newPath"
             }
             else {
                 $status = "Failed"
                 $notes  = "Extractor returned exit code $installExit"
                 $cError++
-                Write-Host "    FAILED - exit code $installExit" -ForegroundColor Red
+                Write-Host ("    FAILED - exit code {0}" -f $installExit) -ForegroundColor Red
                 Write-LogLine -Path $txtLog -Text "FAILED: $notes"
             }
         }
@@ -478,13 +503,13 @@ foreach ($pkg in $pkgFiles) {
         $status = "Error"
         $notes  = $_.Exception.Message
         $cError++
-        Write-Host "    ERROR: $notes" -ForegroundColor Red
+        Write-Host ("    ERROR: {0}" -f $notes) -ForegroundColor Red
         Write-LogLine -Path $txtLog -Text "ERROR: $notes"
     }
 
     # Write CSV row immediately (survives Ctrl+C)
-    $row = [pscustomobject]@{
-        TimeStamp        = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $row = [PSCustomObject]@{
+        TimeStamp        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
         Mode             = $mode
         DetectedType     = $detectedType
         FileName         = $pkg.Name
@@ -503,30 +528,30 @@ foreach ($pkg in $pkgFiles) {
     Write-ProgressBar -Current $index -Total $total -Success $cSuccess -Errors $cError -Skipped ($cSkipped + $cDryRun)
 }
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
-
+# ==============================================================================
+# SUMMARY
+# ==============================================================================
 Write-Host ""
 Write-Host ""
 Write-Host "================================================" -ForegroundColor Cyan
 Write-Host "  DONE" -ForegroundColor Cyan
 Write-Host "================================================" -ForegroundColor Cyan
-Write-Host "  Mode             : $mode"
+Write-Host ("  Mode            : {0}" -f $mode)
 if ($mode -eq 'Single') {
-Write-Host "  Type             : $pkgType"
+    Write-Host ("  Type            : {0}" -f $pkgType)
 }
-Write-Host "  Total            : $total"
-Write-Host "  Success          : $cSuccess"                    -ForegroundColor Green
-Write-Host "  Failed / Errors  : $cError"                     -ForegroundColor Red
-Write-Host "  Dry Run          : $cDryRun"                    -ForegroundColor Yellow
+Write-Host ("  Total           : {0}" -f $total)
+Write-Host ("  Success         : {0}" -f $cSuccess)  -ForegroundColor Green
+Write-Host ("  Failed / Errors : {0}" -f $cError)    -ForegroundColor $(if ($cError -gt 0) { "Red" } else { "Gray" })
+Write-Host ("  Dry Run         : {0}" -f $cDryRun)   -ForegroundColor Yellow
 if ($mode -eq 'Mixed') {
-Write-Host "  Skipped Unknown  : $cSkipped"                   -ForegroundColor Yellow
+    Write-Host ("  Skipped Unknown : {0}" -f $cSkipped) -ForegroundColor Yellow
 }
 Write-Host ""
-Write-Host "  Completed folder : $completedFolder"
-Write-Host "  CSV Log          : $csvLog"
-Write-Host "  TXT Log          : $txtLog"
+Write-Host ("  Completed folder : {0}" -f $completedFolder)
+Write-Host ("  CSV Log          : {0}" -f $csvLog)
+Write-Host ("  TXT Log          : {0}" -f $txtLog)
 Write-Host ""
 
-Write-LogLine -Path $txtLog -Text "Run finished. Mode=$mode, Total=$total, Success=$cSuccess, Failed=$cError, DryRun=$cDryRun, Skipped=$cSkipped"
+Write-LogLine -Path $txtLog -Text ("Run finished. Mode={0}, Total={1}, Success={2}, Failed={3}, DryRun={4}, Skipped={5}" -f $mode, $total, $cSuccess, $cError, $cDryRun, $cSkipped)
+Set-ExitCode 0
