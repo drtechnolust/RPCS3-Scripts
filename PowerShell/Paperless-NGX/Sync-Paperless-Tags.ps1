@@ -11,7 +11,7 @@
 # ============================================
 
 $PaperlessUrl = "http://10.10.1.99:8000"
-$Token = "f9c252393faa9925f8998d8427657bdd3c73aa46"
+$Token = ""
 
 # Set to $true to preview only
 $DryRun = $false
