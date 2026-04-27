@@ -1,519 +1,317 @@
-# OpenBOR Shortcut Generator - Enhanced for Special Characters in Folder Names
-# This version properly handles folders with brackets, ampersands, and other special characters
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Creates Windows shortcuts for OpenBOR games using OpenBOR-aware executable detection.
 
-$rootGameFolder = "D:\Arcade\System roms\OpenBOR Games"
-$shortcutOutputFolder = "$rootGameFolder\Shortcuts"
-$maxDepth = 3
-$folderTimeout = 30
-$logFound = "$shortcutOutputFolder\FoundGames.log"
-$logNotFound = "$shortcutOutputFolder\NotFoundGames.log"
-$logSkipped = "$shortcutOutputFolder\SkippedGames.log"
-$logBlocked = "$shortcutOutputFolder\BlockedFiles.log"
-$logErrors = "$shortcutOutputFolder\ErrorGames.log"
+.DESCRIPTION
+    Scans a folder of OpenBOR game directories and creates .lnk shortcuts.
+    Uses a four-pass search strategy optimized for OpenBOR's typical structure:
 
-# Ensure shortcut output folder exists
-if (!(Test-Path -LiteralPath $shortcutOutputFolder)) {
-    New-Item -ItemType Directory -Path $shortcutOutputFolder -Force | Out-Null
+      Pass 1: Look for OpenBOR.exe / openbor.exe in game root (fastest, most common)
+      Pass 2: Look for any exe with "openbor" or "bor" in the name at root level
+      Pass 3: Check common subfolders (bin, engine, data)
+      Pass 4: Fall back to scoring all .exe files found
+
+    Executable scoring bonuses:
+      OpenBOR.exe (exact)     = 1000
+      Known OpenBOR variants  = 500
+      Contains "openbor"      = 200
+      Located in game root    = 100
+      Alternative names       = 50
+      Too deep (>3 levels)    = -30 penalty
+
+    Shortcut names are converted to title case and have the "OpenBOR - " prefix
+    stripped if present. Special characters handled via -LiteralPath throughout.
+
+.PARAMETER DryRun
+    When $true (default), shows what would be created without writing shortcuts.
+    Set to $false in the CONFIG block to apply.
+
+.EXAMPLE
+    .\Create-OpenBOR-Shortcuts.ps1
+
+.VERSION
+    2.0.0 - Config block, DryRun, CSV log, MIT header. Removed emoji and verbose
+            debug output. LiteralPath used throughout. Logic preserved.
+    1.0.0 - Initial release.
+
+.LICENSE
+    MIT License
+    Copyright (c) Paul Mardis
+#>
+
+# ==============================================================================
+# CONFIG -- Edit this block. Do not put paths anywhere else in this script.
+# ==============================================================================
+$RootGameFolder   = "D:\Arcade\System roms\OpenBOR"
+$ShortcutFolder   = "D:\Arcade\System roms\PC Games\Shortcuts\OpenBOR"
+$MaxDepth         = 3
+$FolderTimeoutSec = 30
+$DryRun           = $true    # Set to $false to write shortcuts
+$LogDir           = Join-Path (Split-Path $ShortcutFolder -Parent) "Logs"
+# ==============================================================================
+
+function Set-ExitCode {
+    param([int]$Code)
+    $global:LASTEXITCODE = $Code
 }
 
-# Clear logs if they exist
-@($logFound, $logNotFound, $logSkipped, $logErrors, $logBlocked) | ForEach-Object {
-    if (Test-Path -LiteralPath $_) {
-        Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue
+if (-not (Test-Path -LiteralPath $RootGameFolder)) {
+    Write-Host "ERROR: OpenBOR library not found: $RootGameFolder" -ForegroundColor Red
+    Set-ExitCode 1
+    return
+}
+
+if (-not $DryRun) {
+    foreach ($D in @($ShortcutFolder, $LogDir)) {
+        if (-not (Test-Path -LiteralPath $D)) { New-Item -ItemType Directory -Path $D -Force | Out-Null }
     }
 }
 
-# Store a hashtable of created shortcuts to check for duplicates
-$createdShortcuts = @{}
+$LogFile = Join-Path $LogDir ("Create-OpenBOR-Shortcuts_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+$LogRows = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-function Get-SafePath {
-    param([string]$Path)
-    
-    # Always use -LiteralPath for paths with special characters
-    # This function helps ensure we're using literal paths consistently
-    return $Path
+function Write-LogRow {
+    param([string]$GameName,[string]$ChosenExe,[string]$ShortcutPath,[string]$Status,[string]$Note)
+    $LogRows.Add([PSCustomObject]@{
+        Timestamp    = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        GameName     = $GameName
+        ChosenExe    = $ChosenExe
+        ShortcutPath = $ShortcutPath
+        Status       = $Status
+        Note         = $Note
+    })
 }
 
-function Test-SafePath {
-    param(
-        [string]$Path,
-        [string]$PathType = "Any"
-    )
-    
+# ------------------------------------------------------------------------------
+# OpenBOR-specific executable scoring
+# ------------------------------------------------------------------------------
+function Get-OpenBORScore {
+    param([string]$ExePath, [string]$GameFolderName, [string]$GameFolderPath)
+
+    $ExeName = [System.IO.Path]::GetFileNameWithoutExtension($ExePath).ToLower()
+    $Score   = 0
+
+    $BlockPatterns = @("*uninstall*","*setup*","*install*","*update*","*config*","*settings*","*helper*","*crash*","*test*","*service*","*server*","*redist*")
+    foreach ($P in $BlockPatterns) {
+        if ($ExeName -like $P) { return -1 }
+    }
+
+    if ($ExeName -eq "openbor")                                { return 1000 }
+
+    $Variants = @("openbor-win","openbor64","openbor32","openbor_win","openborengine","openbor-win64")
+    if ($Variants -contains $ExeName)                          { return 500  }
+
+    if ($ExeName -like "*openbor*")                            { $Score += 200 }
+
+    # Root folder bonus
+    $ExeDir = [System.IO.Path]::GetDirectoryName($ExePath).ToLower()
+    if ($ExeDir -eq $GameFolderPath.ToLower())                 { $Score += 100 }
+
+    $AltNames = @("bor","beatsofrage","game","start","play","run","main")
+    if ($AltNames -contains $ExeName)                          { $Score += 50  }
+
+    # Depth penalty
+    $Depth = ($ExePath.Split('\').Count - $RootGameFolder.Split('\').Count)
+    if ($Depth -gt 3)                                          { $Score -= 30  }
+
+    return $Score
+}
+
+# ------------------------------------------------------------------------------
+# Title-case shortcut name with prefix stripping
+# ------------------------------------------------------------------------------
+function Get-ShortcutName {
+    param([string]$FolderName)
+
+    $Name = $FolderName.Trim()
+
+    # Strip known prefixes
+    foreach ($Prefix in @("OpenBOR - ","BOR - ")) {
+        if ($Name -like "$Prefix*") { $Name = $Name.Substring($Prefix.Length).Trim() }
+    }
+
+    # Title case
+    $TextInfo = (Get-Culture).TextInfo
+    $Name = $TextInfo.ToTitleCase($Name.ToLower())
+
+    # Fix Roman numerals
+    $Name = [regex]::Replace($Name, '\b(I{1,3}|IV|V|VI{1,3}|IX|X)\b', { $args[0].Value.ToUpper() })
+
+    # Sanitize for Windows filename
+    $Name = $Name -replace '[\\/\:\*\?"<>\|]', ''
+    $Name = $Name -replace '&', 'and'
+    if ($Name.Length -gt 60) { $Name = $Name.Substring(0, 57).TrimEnd() + "..." }
+
+    return $Name.Trim()
+}
+
+# ------------------------------------------------------------------------------
+# Four-pass OpenBOR executable finder
+# ------------------------------------------------------------------------------
+function Find-OpenBORExe {
+    param([string]$FolderPath, [string]$GameName)
+
+    # Pass 1: exact OpenBOR.exe in root
+    foreach ($Variant in @("OpenBOR.exe","openbor.exe","OPENBOR.EXE")) {
+        $TestPath = [System.IO.Path]::Combine($FolderPath, $Variant)
+        if (Test-Path -LiteralPath $TestPath -PathType Leaf) {
+            return @(Get-Item -LiteralPath $TestPath)
+        }
+    }
+
+    # Pass 2: any openbor/bor exe at root level
+    $RootExes = @(Get-ChildItem -LiteralPath $FolderPath -Filter "*.exe" -File -ErrorAction SilentlyContinue)
+    $BorExes  = $RootExes | Where-Object { $_.Name -like "*openbor*" -or $_.Name -like "*bor*" }
+    if ($BorExes.Count -gt 0) { return $BorExes }
+
+    # Pass 3: check common subfolders
+    foreach ($Sub in @("bin","engine","OpenBOR","data")) {
+        $SubPath = [System.IO.Path]::Combine($FolderPath, $Sub)
+        if (Test-Path -LiteralPath $SubPath -PathType Container) {
+            $SubExes = @(Get-ChildItem -LiteralPath $SubPath -Filter "*.exe" -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "*openbor*" -or $_.Name -eq "OpenBOR.exe" })
+            if ($SubExes.Count -gt 0) { return $SubExes }
+        }
+    }
+
+    # Pass 4: all exe files for scoring
+    return $RootExes
+}
+
+# ------------------------------------------------------------------------------
+# Shortcut writer
+# ------------------------------------------------------------------------------
+$WshShell       = New-Object -ComObject WScript.Shell
+$CreatedTargets = @{}
+
+function Save-Shortcut {
+    param([string]$TargetExe, [string]$ShortcutName, [string]$OutputFolder)
+
+    if (-not (Test-Path -LiteralPath $TargetExe -PathType Leaf)) { return "error" }
+
+    $ShortcutPath = [System.IO.Path]::Combine($OutputFolder, "$ShortcutName.lnk")
+
+    if (Test-Path -LiteralPath $ShortcutPath) { return "exists_same" }
+    if ($CreatedTargets.ContainsKey($TargetExe)) { return "duplicate" }
+
     try {
-        if ($PathType -eq "Container") {
-            return Test-Path -LiteralPath $Path -PathType Container -ErrorAction Stop
-        } elseif ($PathType -eq "Leaf") {
-            return Test-Path -LiteralPath $Path -PathType Leaf -ErrorAction Stop
-        } else {
-            return Test-Path -LiteralPath $Path -ErrorAction Stop
-        }
-    } catch {
-        return $false
-    }
-}
-
-function Get-SafeChildItem {
-    param(
-        [string]$Path,
-        [string]$Filter = $null,
-        [switch]$File,
-        [switch]$Directory,
-        [switch]$Recurse
-    )
-    
-    $params = @{
-        LiteralPath = $Path
-        ErrorAction = 'Stop'
-    }
-    
-    if ($Filter) { $params['Filter'] = $Filter }
-    if ($File) { $params['File'] = $true }
-    if ($Directory) { $params['Directory'] = $true }
-    if ($Recurse) { $params['Recurse'] = $true }
-    
-    try {
-        return Get-ChildItem @params
-    } catch {
-        Write-Host "    Error accessing path: $_" -ForegroundColor Red
-        return @()
-    }
-}
-
-function Join-SafePath {
-    param(
-        [string]$Path,
-        [string]$ChildPath
-    )
-    
-    # Use [System.IO.Path]::Combine for safer path joining
-    return [System.IO.Path]::Combine($Path, $ChildPath)
-}
-
-function Get-OpenBORExecutableScore {
-    param($exePath, $gameFolderName)
-    
-    try {
-        $exeName = [System.IO.Path]::GetFileNameWithoutExtension($exePath).ToLower()
-        $score = 0
-        
-        Write-Host "      Analyzing: $exeName" -ForegroundColor DarkYellow
-        
-        # Block obviously non-game executables
-        $blockPatterns = @(
-            "*uninstall*", "*setup*", "*install*", "*update*", 
-            "*config*", "*settings*", "*helper*", "*crash*", 
-            "*test*", "*service*", "*server*", "*redist*"
-        )
-        
-        foreach ($pattern in $blockPatterns) {
-            if ($exeName -like $pattern) {
-                Write-Host "        BLOCKED by pattern: $pattern" -ForegroundColor Red
-                return -1
-            }
-        }
-        
-        # HIGHEST PRIORITY: OpenBOR.exe is the standard executable name
-        if ($exeName -eq "openbor") { 
-            Write-Host "        MATCH: Standard OpenBOR.exe (1000 points)" -ForegroundColor Green
-            return 1000
-        }
-        
-        # HIGH PRIORITY: Variations of OpenBOR executable names
-        $openborVariations = @("openbor-win", "openbor64", "openbor32", "openbor_win", "openborengine", "openbor-win64")
-        if ($openborVariations -contains $exeName) {
-            Write-Host "        MATCH: OpenBOR variation (500 points)" -ForegroundColor Green
-            return 500
-        }
-        
-        # MEDIUM-HIGH PRIORITY: Any executable with "openbor" in the name
-        if ($exeName -like "*openbor*") {
-            $score += 200
-            Write-Host "        PARTIAL: Contains 'openbor' (+200 points)" -ForegroundColor Yellow
-        }
-        
-        # Priority for executables in root directory
-        try {
-            $exeLocation = [System.IO.Path]::GetDirectoryName($exePath)
-            $currentFolder = Get-Item -LiteralPath $exeLocation -ErrorAction SilentlyContinue
-            
-            if ($currentFolder) {
-                # Check if we're in the game's root folder
-                $gameRootFolder = Get-Item -LiteralPath (Join-SafePath $rootGameFolder $gameFolderName) -ErrorAction SilentlyContinue
-                if ($gameRootFolder -and $currentFolder.FullName -eq $gameRootFolder.FullName) {
-                    $score += 100
-                    Write-Host "        BONUS: In game root folder (+100 points)" -ForegroundColor Yellow
-                }
-            }
-        } catch {
-            # Simple depth check as fallback
-            $relativePath = $exePath.Substring($rootGameFolder.Length)
-            $depth = ($relativePath -split '\\').Count - 2
-            if ($depth -eq 1) {
-                $score += 50
-                Write-Host "        BONUS: Appears to be in root (+50 points)" -ForegroundColor Yellow
-            }
-        }
-        
-        # LOWER PRIORITY: Alternative names
-        $alternativeNames = @("bor", "beatsofrage", "game", "start", "play", "run", "main")
-        if ($alternativeNames -contains $exeName) {
-            $score += 50
-            Write-Host "        MATCH: Alternative name (+50 points)" -ForegroundColor Yellow
-        }
-        
-        # Penalize if too deep in folder structure
-        $folderDepth = ($exePath.Split('\').Count - $rootGameFolder.Split('\').Count)
-        if ($folderDepth -gt 3) {
-            $score -= 30
-            Write-Host "        PENALTY: Too deep in folders (-30 points)" -ForegroundColor Yellow
-        }
-        
-        Write-Host "        FINAL SCORE: $score points" -ForegroundColor $(if ($score -ge 100) { "Green" } elseif ($score -gt 0) { "Yellow" } else { "Red" })
-        return $score
-        
-    } catch {
-        Write-Host "        ERROR in scoring: $_" -ForegroundColor Red
-        return 0
-    }
-}
-
-function Convert-ToSentenceCase {
-    param([string]$text)
-    
-    if ([string]::IsNullOrWhiteSpace($text)) {
-        return $text
-    }
-    
-    try {
-        $cleaned = $text.Trim()
-        
-        # Remove common prefixes
-        if ($cleaned.StartsWith("OpenBOR - ", [StringComparison]::InvariantCultureIgnoreCase)) {
-            $cleaned = $cleaned.Substring(10).Trim()
-        } elseif ($cleaned.StartsWith("BOR - ", [StringComparison]::InvariantCultureIgnoreCase)) {
-            $cleaned = $cleaned.Substring(6).Trim()
-        }
-        
-        # Convert to sentence case
-        $textInfo = (Get-Culture).TextInfo
-        $result = $textInfo.ToTitleCase($cleaned.ToLower())
-        
-        # Fix Roman numerals
-        $result = $result -replace '\b(I{1,3}|IV|V|VI{1,3}|IX|X)\b', { $_.Value.ToUpper() }
-        
-        return $result.Trim()
-        
-    } catch {
-        return $text.Trim()
-    }
-}
-
-function Create-Shortcut {
-    param (
-        [string]$targetExe,
-        [string]$shortcutName,
-        [string]$outputFolder
-    )
-    
-    Write-Host "    Creating shortcut for: '$shortcutName'" -ForegroundColor Cyan
-    
-    try {
-        # Validate inputs
-        if ([string]::IsNullOrWhiteSpace($targetExe) -or 
-            [string]::IsNullOrWhiteSpace($shortcutName) -or 
-            [string]::IsNullOrWhiteSpace($outputFolder)) {
-            Write-Host "    ✗ Invalid parameters" -ForegroundColor Red
-            return "error"
-        }
-        
-        # Validate target exe exists
-        if (!(Test-SafePath $targetExe -PathType "Leaf")) {
-            Write-Host "    ✗ Target executable does not exist: '$targetExe'" -ForegroundColor Red
-            return "error"
-        }
-        
-        # Ensure output folder exists
-        if (!(Test-SafePath $outputFolder -PathType "Container")) {
-            New-Item -ItemType Directory -Path $outputFolder -Force | Out-Null
-        }
-        
-        # Convert to sentence case and sanitize
-        $sentenceCaseShortcutName = Convert-ToSentenceCase -text $shortcutName
-        $safeShortcutName = $sentenceCaseShortcutName -replace '[\\\/\:\*\?"<>\|]', '_'
-        $safeShortcutName = $safeShortcutName -replace '&', 'and'
-        
-        # Limit filename length
-        if ($safeShortcutName.Length -gt 50) {
-            $safeShortcutName = $safeShortcutName.Substring(0, 47) + "..."
-        }
-        
-        # Check for duplicates
-        $shortcutPath = Join-SafePath $outputFolder "$safeShortcutName.lnk"
-        
-        if (Test-SafePath $shortcutPath) {
-            Write-Host "    ↻ Shortcut already exists" -ForegroundColor Blue
-            return "exists_same"
-        }
-        
-        if ($createdShortcuts.ContainsKey($targetExe)) {
-            Write-Host "    ↻ Duplicate executable" -ForegroundColor Blue
-            return "duplicate"
-        }
-        
-        # Create the shortcut
-        $WScriptShell = New-Object -ComObject WScript.Shell
-        $shortcut = $WScriptShell.CreateShortcut($shortcutPath)
-        $shortcut.TargetPath = $targetExe
-        $shortcut.WorkingDirectory = [System.IO.Path]::GetDirectoryName($targetExe)
-        $shortcut.Save()
-        
-        # Verify creation
-        if (Test-SafePath $shortcutPath) {
-            $createdShortcuts[$targetExe] = $sentenceCaseShortcutName
-            Write-Host "    ✅ Shortcut created successfully" -ForegroundColor Green
-            return "created"
-        } else {
-            Write-Host "    ✗ Shortcut creation failed" -ForegroundColor Red
-            return "error"
-        }
-        
-    } catch {
-        Write-Host "    ✗ Error in Create-Shortcut: $_" -ForegroundColor Red
+        $SC = $WshShell.CreateShortcut($ShortcutPath)
+        $SC.TargetPath       = $TargetExe
+        $SC.WorkingDirectory = [System.IO.Path]::GetDirectoryName($TargetExe)
+        $SC.Save()
+        $CreatedTargets[$TargetExe] = $ShortcutName
+        if (Test-Path -LiteralPath $ShortcutPath) { return "created" }
         return "error"
-    }
+    } catch { return "error" }
 }
 
-function Find-OpenBORExecutables {
-    param (
-        [string]$folderPath,
-        [int]$maxDepth,
-        [string]$gameName,
-        [int]$timeout
-    )
-    
-    $displayName = if ($gameName.Length -gt 50) { $gameName.Substring(0, 47) + "..." } else { $gameName }
-    Write-Host "Scanning: $displayName..." -ForegroundColor Cyan
-    
-    $exeFiles = @()
-    
-    try {
-        # Validate folder access
-        if (!(Test-SafePath $folderPath -PathType "Container")) {
-            Write-Host "  ✗ Folder does not exist or is not accessible: $folderPath" -ForegroundColor Red
-            "$gameName - Folder not accessible: $folderPath" | Out-File -FilePath $logErrors -Append -ErrorAction SilentlyContinue
-            return @()
-        }
-        
-        Write-Host "  ✓ Folder accessible" -ForegroundColor Green
-        
-        # FIRST: Check for OpenBOR.exe in root directory
-        Write-Host "  Checking root for OpenBOR.exe..." -ForegroundColor Gray
-        
-        $openBORVariants = @("OpenBOR.exe", "openbor.exe", "OPENBOR.EXE", "OpenBor.exe")
-        foreach ($variant in $openBORVariants) {
-            $testPath = Join-SafePath $folderPath $variant
-            if (Test-SafePath $testPath -PathType "Leaf") {
-                Write-Host "  ✓ Found $variant in root!" -ForegroundColor Green
-                try {
-                    $foundFile = Get-Item -LiteralPath $testPath -ErrorAction Stop
-                    $exeFiles += $foundFile
-                    return $exeFiles
-                } catch {
-                    Write-Host "    Error accessing file: $_" -ForegroundColor Yellow
-                }
-            }
-        }
-        
-        # SECOND: Search for any .exe files with OpenBOR patterns
-        Write-Host "  Searching for OpenBOR executables..." -ForegroundColor Gray
-        $allExeFiles = Get-SafeChildItem -Path $folderPath -Filter "*.exe" -File
-        
-        foreach ($exe in $allExeFiles) {
-            $exeName = $exe.Name.ToLower()
-            if ($exeName -like "*openbor*" -or $exeName -like "*bor*") {
-                Write-Host "    Found potential OpenBOR file: $($exe.Name)" -ForegroundColor Yellow
-                $exeFiles += $exe
-            }
-        }
-        
-        if ($exeFiles.Count -gt 0) {
-            return $exeFiles
-        }
-        
-        # THIRD: Check common subfolders
-        Write-Host "  Checking subfolders..." -ForegroundColor Gray
-        $subfolders = @("bin", "engine", "OpenBOR", "data")
-        foreach ($subfolder in $subfolders) {
-            $subPath = Join-SafePath $folderPath $subfolder
-            if (Test-SafePath $subPath -PathType "Container") {
-                $subExeFiles = Get-SafeChildItem -Path $subPath -Filter "*.exe" -File
-                foreach ($exe in $subExeFiles) {
-                    if ($exe.Name -like "*openbor*" -or $exe.Name -eq "OpenBOR.exe") {
-                        Write-Host "  ✓ Found $($exe.Name) in $subfolder!" -ForegroundColor Green
-                        $exeFiles += $exe
-                    }
-                }
-            }
-        }
-        
-        # FOURTH: If still nothing, get all exe files for scoring
-        if ($exeFiles.Count -eq 0) {
-            Write-Host "  Getting all .exe files for analysis..." -ForegroundColor Gray
-            $exeFiles = Get-SafeChildItem -Path $folderPath -Filter "*.exe" -File
-        }
-        
-        Write-Host "  Final result: Found $($exeFiles.Count) executable(s)" -ForegroundColor $(if ($exeFiles.Count -gt 0) { "Green" } else { "Red" })
-        
-    } catch {
-        Write-Host "  ✗ Error during search: $_" -ForegroundColor Red
-        "$gameName - Search error: $folderPath - $_" | Out-File -FilePath $logErrors -Append -ErrorAction SilentlyContinue
-    }
-    
-    return $exeFiles
-}
-
-function Format-TimeSpan {
-    param ([TimeSpan]$TimeSpan)
-    
-    if ($TimeSpan.TotalHours -ge 1) {
-        return "{0:h\:mm\:ss}" -f $TimeSpan
-    } else {
-        return "{0:mm\:ss}" -f $TimeSpan
-    }
-}
-
-# Main script execution
-Write-Host "Starting OpenBOR Shortcut Generator..." -ForegroundColor Green
-Write-Host "Source: $rootGameFolder" -ForegroundColor Cyan
-Write-Host "Output: $shortcutOutputFolder" -ForegroundColor Cyan
+# ==============================================================================
+# BANNER
+# ==============================================================================
 Write-Host ""
-
-Write-Host "Enumerating game folders..." -ForegroundColor Yellow
-try {
-    $gameFolders = Get-SafeChildItem -Path $rootGameFolder -Directory
-    Write-Host "Found $($gameFolders.Count) game folders" -ForegroundColor Green
-    
-    # Show sample folder names
-    Write-Host "Sample folder names:" -ForegroundColor Gray
-    for ($i = 0; $i -lt [Math]::Min(5, $gameFolders.Count); $i++) {
-        Write-Host "  [$($i+1)] '$($gameFolders[$i].Name)'" -ForegroundColor Gray
-    }
+Write-Host "Create-OpenBOR-Shortcuts" -ForegroundColor Cyan
+Write-Host "========================" -ForegroundColor Cyan
+Write-Host "  Library   : $RootGameFolder"
+Write-Host "  Shortcuts : $ShortcutFolder"
+Write-Host "  DryRun    : $DryRun"
+Write-Host ""
+if ($DryRun) {
+    Write-Host "  [DRY RUN] No shortcuts will be written." -ForegroundColor Yellow
     Write-Host ""
-    
-} catch {
-    Write-Host "Error enumerating folders: $_" -ForegroundColor Red
-    Write-Host "Please check the root game folder path: $rootGameFolder" -ForegroundColor Yellow
-    exit 1
 }
 
-$total = $gameFolders.Count
-$index = 0
-$created = 0
-$skipped = 0
-$notFound = 0
-$errors = 0
+# ==============================================================================
+# MAIN LOOP
+# ==============================================================================
+$GameFolders = @(Get-ChildItem -LiteralPath $RootGameFolder -Directory -ErrorAction Stop) | Sort-Object Name
+$Total       = $GameFolders.Count
+$Index       = 0
+$CntCreated  = 0
+$CntSkipped  = 0
+$CntNotFound = 0
+$CntErrors   = 0
 
-$startTime = Get-Date
+foreach ($GameDir in $GameFolders) {
+    $Index++
+    $GameName = $GameDir.Name
 
-foreach ($folder in $gameFolders) {
-    $index++
-    $gameName = $folder.Name
-    
-    # Update progress
-    $percentComplete = ($index / $total) * 100
-    Write-Progress -Id 1 -Activity "Processing OpenBOR Games" -Status "$gameName ($index of $total)" -PercentComplete $percentComplete
-    
+    Write-Progress -Activity "Create-OpenBOR-Shortcuts" -Status "$GameName ($Index of $Total)" `
+        -PercentComplete ([int](($Index / $Total) * 100))
+
     try {
-        Write-Host "Processing [$index/$total]: $gameName" -ForegroundColor White
-        
-        # Use folder's FullName directly
-        $actualPath = $folder.FullName
-        
-        # Find executables
-        $exeFiles = Find-OpenBORExecutables -folderPath $actualPath -maxDepth $maxDepth -gameName $gameName -timeout $folderTimeout
-        
-        if ($exeFiles.Count -eq 0) {
-            "$gameName - No OpenBOR executable found" | Out-File -FilePath $logNotFound -Append
-            Write-Host "  ✗ No executables found" -ForegroundColor Red
-            $notFound++
+        $ExeFiles = @(Find-OpenBORExe -FolderPath $GameDir.FullName -GameName $GameName)
+
+        if ($ExeFiles.Count -eq 0) {
+            Write-Host ("  [NOT FOUND] {0}" -f $GameName) -ForegroundColor DarkGray
+            Write-LogRow -GameName $GameName -Status "NotFound" -Note "No .exe files found"
+            $CntNotFound++
             continue
         }
-        
-        # Score and filter executables
-        $scored = @()
-        foreach ($exe in $exeFiles) {
-            $score = Get-OpenBORExecutableScore -exePath $exe.FullName -gameFolderName $gameName
-            
-            if ($score -ge 0) {
-                $scored += [PSCustomObject]@{
-                    Path  = $exe.FullName
-                    Score = $score
-                }
+
+        $Scored = $ExeFiles | ForEach-Object {
+            [PSCustomObject]@{
+                Path  = $_.FullName
+                Score = Get-OpenBORScore -ExePath $_.FullName -GameFolderName $GameName -GameFolderPath $GameDir.FullName
             }
-        }
-        
-        if ($scored.Count -eq 0) {
-            "$gameName - No suitable executable found (all blocked)" | Out-File -FilePath $logNotFound -Append
-            Write-Host "  ✗ All executables blocked by filters" -ForegroundColor Red
-            $notFound++
+        } | Where-Object { $_.Score -ge 0 } | Sort-Object Score -Descending
+
+        if ($Scored.Count -eq 0) {
+            Write-Host ("  [BLOCKED]   {0}" -f $GameName) -ForegroundColor DarkGray
+            Write-LogRow -GameName $GameName -Status "AllBlocked" -Note "All .exe files blocked by filters"
+            $CntNotFound++
             continue
         }
-        
-        # Select best executable
-        $scored = $scored | Sort-Object Score -Descending
-        $chosenExe = $scored[0].Path
-        
-        Write-Host "  Selected: $(Split-Path $chosenExe -Leaf) (score: $($scored[0].Score))" -ForegroundColor Green
-        
-        # Create shortcut
-        $shortcutStatus = Create-Shortcut -targetExe $chosenExe -shortcutName $gameName -outputFolder $shortcutOutputFolder
-        
-        switch ($shortcutStatus) {
-            "created" {
-                $shortcutName = $createdShortcuts[$chosenExe]
-                "$gameName -> '$shortcutName' - $chosenExe" | Out-File -FilePath $logFound -Append
-                Write-Host "  ✓ Created: '$shortcutName'" -ForegroundColor Green
-                $created++
-            }
-            "exists_same" {
-                "$gameName - Shortcut already exists" | Out-File -FilePath $logSkipped -Append
-                $skipped++
-            }
-            "duplicate" {
-                "$gameName - Duplicate executable" | Out-File -FilePath $logSkipped -Append
-                $skipped++
-            }
-            "error" {
-                "$gameName - Error creating shortcut" | Out-File -FilePath $logErrors -Append
-                Write-Host "  ✗ Error creating shortcut" -ForegroundColor Red
-                $errors++
-            }
+
+        $ChosenExe    = $Scored[0].Path
+        $ShortcutName = Get-ShortcutName -FolderName $GameName
+        $ShortcutOut  = [System.IO.Path]::Combine($ShortcutFolder, "$ShortcutName.lnk")
+
+        if ($DryRun) {
+            Write-Host ("  [WOULD CREATE] {0}" -f $ShortcutName) -ForegroundColor Cyan
+            Write-Host ("    Exe   : {0}" -f $ChosenExe)
+            Write-Host ("    Score : {0}" -f $Scored[0].Score)
+            Write-LogRow -GameName $GameName -ChosenExe $ChosenExe -ShortcutPath $ShortcutOut `
+                -Status "DryRun" -Note "Score=$($Scored[0].Score)"
+            $CntCreated++
+            continue
         }
-        
-    } catch {
-        Write-Host "  ✗ Error processing $gameName`: $_" -ForegroundColor Red
-        "$gameName - Processing error: $_" | Out-File -FilePath $logErrors -Append
-        $errors++
+
+        $Result = Save-Shortcut -TargetExe $ChosenExe -ShortcutName $ShortcutName -OutputFolder $ShortcutFolder
+
+        switch ($Result) {
+            "created"     { Write-Host ("  [OK]     {0}" -f $ShortcutName) -ForegroundColor Green;    $CntCreated++  }
+            "exists_same" { Write-Host ("  [EXISTS] {0}" -f $ShortcutName) -ForegroundColor DarkGray; $CntSkipped++  }
+            "duplicate"   { Write-Host ("  [DUPE]   {0}" -f $ShortcutName) -ForegroundColor DarkGray; $CntSkipped++  }
+            default       { Write-Host ("  [ERROR]  {0}" -f $ShortcutName) -ForegroundColor Red;      $CntErrors++   }
+        }
+        Write-LogRow -GameName $GameName -ChosenExe $ChosenExe -ShortcutPath $ShortcutOut `
+            -Status $Result -Note "Score=$($Scored[0].Score)"
+    }
+    catch {
+        Write-Host ("  [ERROR]  {0} -- {1}" -f $GameName, $_.Exception.Message) -ForegroundColor Red
+        Write-LogRow -GameName $GameName -Status "Error" -Note $_.Exception.Message
+        $CntErrors++
     }
 }
 
-$totalTime = (Get-Date) - $startTime
-$formattedTotalTime = Format-TimeSpan -TimeSpan $totalTime
+Write-Progress -Activity "Create-OpenBOR-Shortcuts" -Completed
+
+if ($LogRows.Count -gt 0 -and -not $DryRun) {
+    try { $LogRows | Export-Csv -LiteralPath $LogFile -NoTypeInformation -Encoding UTF8 } catch {}
+    Write-Host ""
+    Write-Host ("  Log: {0}" -f $LogFile) -ForegroundColor Gray
+}
 
 Write-Host ""
-Write-Host "✅ OpenBOR Shortcut Generation Complete!" -ForegroundColor Green
-Write-Host "🎮 Shortcuts saved to: $shortcutOutputFolder" -ForegroundColor Cyan
-Write-Host "⏱️ Total time: $formattedTotalTime" -ForegroundColor Yellow
-Write-Host "📊 Results:" -ForegroundColor White
-Write-Host "   • $created shortcuts created" -ForegroundColor Green
-Write-Host "   • $skipped shortcuts skipped (already exist)" -ForegroundColor Blue
-Write-Host "   • $notFound games with no suitable executable found" -ForegroundColor Red
-Write-Host "   • $errors errors encountered" -ForegroundColor Red
+Write-Host "Summary" -ForegroundColor White
+Write-Host ("  {0,-12} {1}" -f "Created :", $CntCreated)  -ForegroundColor Green
+Write-Host ("  {0,-12} {1}" -f "Skipped :", $CntSkipped)  -ForegroundColor Gray
+Write-Host ("  {0,-12} {1}" -f "Not found:", $CntNotFound) -ForegroundColor DarkGray
+Write-Host ("  {0,-12} {1}" -f "Errors :", $CntErrors)    -ForegroundColor $(if ($CntErrors -gt 0) { "Red" } else { "Gray" })
+if ($DryRun) {
+    Write-Host ""
+    Write-Host "  DRY RUN complete. Set `$DryRun = `$false in the CONFIG block to apply." -ForegroundColor Yellow
+}
 Write-Host ""
-Write-Host "📄 Check the log files for detailed information:" -ForegroundColor White
-Write-Host "   • FoundGames.log - Successfully created shortcuts" -ForegroundColor Green
-Write-Host "   • NotFoundGames.log - Games where no executable was found" -ForegroundColor Red
-Write-Host "   • SkippedGames.log - Games that were skipped" -ForegroundColor Blue
-Write-Host "   • ErrorGames.log - Games that caused errors" -ForegroundColor Red
-Write-Host "   • BlockedFiles.log - Executables blocked by filters" -ForegroundColor Yellow
+Set-ExitCode 0
