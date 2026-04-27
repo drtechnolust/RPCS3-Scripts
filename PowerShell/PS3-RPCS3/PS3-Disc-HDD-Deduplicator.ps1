@@ -1,387 +1,385 @@
-﻿#Requires -Version 5.1
-
+#Requires -Version 5.1
 <#
 .SYNOPSIS
-    PS3 Disc vs HDD Duplicate Organizer v1.0
+    Identifies PS3 disc games that also exist as HDD copies and moves disc
+    duplicates to a holding folder.
 
 .DESCRIPTION
-    Scans dev_hdd0\disc and dev_hdd0\game folders, parses PARAM.SFO
-    from each game to extract Title ID and game name, matches duplicates,
-    and moves disc copies to _DeDuplication when an HDD copy exists.
+    Scans both dev_hdd0\disc and dev_hdd0\game folders, reads PARAM.SFO from
+    each game to extract the Title ID, and matches disc games against HDD copies
+    by Title ID. When a match is found, the HDD copy is preferred and the disc
+    folder is moved to dev_hdd0\_DeDuplication_Disc.
 
-    - Reads PARAM.SFO binary format natively — no external tools needed
-    - Skips game data folders (CATEGORY = GD), cache, install folders
-    - Prefers HDD copy, moves disc copy
-    - Dry run by default
+    PARAM.SFO is parsed natively -- no external tools required.
+    Disc-only games (no HDD copy) are kept in place.
+    HDD-only games are logged but not touched.
+
+    Non-game folders are skipped: DATA, INSTALL, cache, lock files.
+    Game data folders (CATEGORY = GD, SD, AS) are also skipped.
+
+    Run with DryRun = $true first to review the CSV log before moving anything.
+
+.PARAMETER DryRun
+    When $true (default), shows what would be moved without touching any folders.
+    Set to $false in the CONFIG block to apply changes.
+
+.EXAMPLE
+    .\PS3-Disc-HDD-Deduplicator.ps1
+
+.VERSION
+    2.0.0 - Config block with pre-filled PS3 paths, DryRun default, MIT license.
+             Replaced Unicode dashes with ASCII. Logic unchanged.
+    1.0.0 - Initial release.
+
+.LICENSE
+    MIT License
+    Copyright (c) Paul Mardis
 #>
 
-# ── Prompts ───────────────────────────────────────────────────────────────────
-$PS3Root  = Read-Host "Enter path to Sony Playstation 3 folder (contains dev_hdd0)"
-$choice   = Read-Host "Dry run? (Y/N)"
-$DryRun   = $choice -match '^y'
-
+# ==============================================================================
+# CONFIG -- Edit this block. Do not put paths anywhere else in this script.
+# ==============================================================================
+$PS3Root  = "D:\Arcade\System roms\Sony Playstation 3"
+$DryRun   = $true    # Set to $false to actually move folders
+# Derived paths (do not edit unless your folder structure differs)
 $DiscPath  = Join-Path $PS3Root "dev_hdd0\disc"
 $GamePath  = Join-Path $PS3Root "dev_hdd0\game"
 $DedupeDir = Join-Path $PS3Root "dev_hdd0\_DeDuplication_Disc"
-
-# ==============================================================================
-# FUNCTIONS
+$LogDir    = Join-Path $PS3Root "_Logs"
 # ==============================================================================
 
+function Set-ExitCode {
+    param([int]$Code)
+    $global:LASTEXITCODE = $Code
+}
+
+# ------------------------------------------------------------------------------
+# Parse PARAM.SFO -- returns hashtable of all fields or $null
+# ------------------------------------------------------------------------------
 function Read-ParamSfo {
     param([string]$SfoPath)
 
     try {
-        $bytes = [System.IO.File]::ReadAllBytes($SfoPath)
+        $Bytes = [System.IO.File]::ReadAllBytes($SfoPath)
 
-        # Validate magic bytes: 0x00 P S F
-        if ($bytes.Length -lt 20 -or
-            $bytes[0] -ne 0x00 -or
-            $bytes[1] -ne 0x50 -or
-            $bytes[2] -ne 0x53 -or
-            $bytes[3] -ne 0x46) {
-            return $null
-        }
+        if ($Bytes.Length -lt 20 -or
+            $Bytes[0] -ne 0x00 -or $Bytes[1] -ne 0x50 -or
+            $Bytes[2] -ne 0x53 -or $Bytes[3] -ne 0x46) { return $null }
 
-        $keyTableOffset  = [BitConverter]::ToInt32($bytes, 8)
-        $dataTableOffset = [BitConverter]::ToInt32($bytes, 12)
-        $entryCount      = [BitConverter]::ToInt32($bytes, 16)
+        $KeyTableOffset  = [BitConverter]::ToInt32($Bytes, 8)
+        $DataTableOffset = [BitConverter]::ToInt32($Bytes, 12)
+        $EntryCount      = [BitConverter]::ToInt32($Bytes, 16)
 
-        $result = @{}
+        $Result = @{}
 
-        for ($i = 0; $i -lt $entryCount; $i++) {
-            $entryBase   = 20 + ($i * 16)
-            $keyOffset   = [BitConverter]::ToInt16($bytes, $entryBase)
-            $dataType    = $bytes[$entryBase + 3]
-            $dataLen     = [BitConverter]::ToInt32($bytes, $entryBase + 4)
-            $dataOffset  = [BitConverter]::ToInt32($bytes, $entryBase + 12)
+        for ($i = 0; $i -lt $EntryCount; $i++) {
+            $EntryBase  = 20 + ($i * 16)
+            $KeyOffset  = [BitConverter]::ToInt16($Bytes, $EntryBase)
+            $DataType   = $Bytes[$EntryBase + 3]
+            $DataLen    = [BitConverter]::ToInt32($Bytes, $EntryBase + 4)
+            $DataOffset = [BitConverter]::ToInt32($Bytes, $EntryBase + 12)
 
-            # Read key string
-            $keyStart = $keyTableOffset + $keyOffset
-            $keyEnd   = $keyStart
-            while ($keyEnd -lt $bytes.Length -and $bytes[$keyEnd] -ne 0) { $keyEnd++ }
-            $key = [System.Text.Encoding]::ASCII.GetString($bytes, $keyStart, $keyEnd - $keyStart)
+            $KeyStart = $KeyTableOffset + $KeyOffset
+            $KeyEnd   = $KeyStart
+            while ($KeyEnd -lt $Bytes.Length -and $Bytes[$KeyEnd] -ne 0) { $KeyEnd++ }
+            $Key = [System.Text.Encoding]::ASCII.GetString($Bytes, $KeyStart, $KeyEnd - $KeyStart)
 
-            # Read value
-            $valStart = $dataTableOffset + $dataOffset
-            if ($dataType -eq 2 -or $dataType -eq 0x04) {
-                # String (utf-8)
-                $rawVal = [System.Text.Encoding]::UTF8.GetString($bytes, $valStart, $dataLen).TrimEnd([char]0)
-                $result[$key] = $rawVal
-            } elseif ($dataType -eq 4) {
-                # Integer
-                $result[$key] = [BitConverter]::ToInt32($bytes, $valStart)
+            $ValStart = $DataTableOffset + $DataOffset
+
+            if ($DataType -eq 2 -or $DataType -eq 0x04) {
+                $Result[$Key] = [System.Text.Encoding]::UTF8.GetString($Bytes, $ValStart, $DataLen).TrimEnd([char]0)
+            } elseif ($DataType -eq 4) {
+                $Result[$Key] = [BitConverter]::ToInt32($Bytes, $ValStart)
             }
         }
 
-        return $result
+        return $Result
     }
-    catch {
-        return $null
-    }
+    catch { return $null }
 }
 
+# ------------------------------------------------------------------------------
+# Region from Title ID prefix
+# ------------------------------------------------------------------------------
 function Get-RegionFromTitleId {
     param([string]$TitleId)
     if ($TitleId -match '^(BLUS|BCUS|NPUB)') { return 'USA' }
     if ($TitleId -match '^(BLES|BCES|NPEB)') { return 'Europe' }
     if ($TitleId -match '^(BLJS|BCJS|BLJM|BCJM|NPJB)') { return 'Japan' }
-    if ($TitleId -match '^(BLAS|BCAS|NPUB)') { return 'Asia' }
+    if ($TitleId -match '^(BLAS|BCAS)') { return 'Asia' }
     if ($TitleId -match '^NP') { return 'PSN' }
     return 'Unknown'
 }
 
-function Get-RegionScore {
-    param([string]$Region)
-    switch ($Region) {
-        'USA'     { return 0 }
-        'Europe'  { return 1 }
-        'Asia'    { return 2 }
-        'Japan'   { return 3 }
-        'PSN'     { return 4 }
-        default   { return 99 }
-    }
-}
-
+# ------------------------------------------------------------------------------
+# Find PARAM.SFO for a disc or HDD game folder
+# ------------------------------------------------------------------------------
 function Find-ParamSfo {
     param([string]$FolderPath, [string]$Type)
 
     if ($Type -eq 'disc') {
-        # disc\GameName\PS3_GAME\PARAM.SFO
-        $sfo = Join-Path $FolderPath "PS3_GAME\PARAM.SFO"
-        if (Test-Path $sfo) { return $sfo }
-        # Some disc dumps have it at root
-        $sfo = Join-Path $FolderPath "PARAM.SFO"
-        if (Test-Path $sfo) { return $sfo }
-    }
-    elseif ($Type -eq 'game') {
-        # game\TITLEID\PARAM.SFO
-        $sfo = Join-Path $FolderPath "PARAM.SFO"
-        if (Test-Path $sfo) { return $sfo }
+        $Sfo = Join-Path $FolderPath "PS3_GAME\PARAM.SFO"
+        if (Test-Path -LiteralPath $Sfo) { return $Sfo }
+        $Sfo = Join-Path $FolderPath "PARAM.SFO"
+        if (Test-Path -LiteralPath $Sfo) { return $Sfo }
+    } elseif ($Type -eq 'game') {
+        $Sfo = Join-Path $FolderPath "PARAM.SFO"
+        if (Test-Path -LiteralPath $Sfo) { return $Sfo }
     }
     return $null
 }
 
 # ==============================================================================
-# MAIN
+# PRE-FLIGHT
 # ==============================================================================
+foreach ($Path in @($DiscPath, $GamePath)) {
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Write-Host ("ERROR: Folder not found: {0}" -f $Path) -ForegroundColor Red
+        Set-ExitCode 1
+        return
+    }
+}
 
-try {
-    Write-Host ""
-    Write-Host "PS3 Disc vs HDD Duplicate Organizer v1.0" -ForegroundColor Cyan
-    Write-Host "─────────────────────────────────────────" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "Disc folder : $DiscPath"  -ForegroundColor Yellow
-    Write-Host "Game folder : $GamePath"  -ForegroundColor Yellow
-    Write-Host "Dedupe dir  : $DedupeDir" -ForegroundColor Yellow
-    Write-Host "Mode        : $(if ($DryRun) { 'Dry Run — no files will be moved' } else { 'LIVE — folders WILL be moved' })" -ForegroundColor $(if ($DryRun) { 'Green' } else { 'Red' })
-    Write-Host ""
+if (-not $DryRun -and -not (Test-Path -LiteralPath $DedupeDir)) {
+    New-Item -Path $DedupeDir -ItemType Directory -Force | Out-Null
+}
 
-    foreach ($path in @($DiscPath, $GamePath)) {
-        if (-not (Test-Path $path)) {
-            throw "Folder not found: $path"
-        }
+if (-not (Test-Path -LiteralPath $LogDir)) {
+    New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
+}
+
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$LogFile   = Join-Path $LogDir ("PS3-Disc-HDD-Deduplicator_{0}.csv" -f $Timestamp)
+
+# ==============================================================================
+# BANNER
+# ==============================================================================
+Write-Host ""
+Write-Host "PS3 Disc vs HDD Deduplicator" -ForegroundColor Cyan
+Write-Host "============================" -ForegroundColor Cyan
+Write-Host ("  Disc folder : {0}" -f $DiscPath)  -ForegroundColor Yellow
+Write-Host ("  Game folder : {0}" -f $GamePath)  -ForegroundColor Yellow
+Write-Host ("  Dedupe dir  : {0}" -f $DedupeDir) -ForegroundColor Yellow
+Write-Host ("  Mode        : {0}" -f $(if ($DryRun) { "Dry Run -- no folders will be moved" } else { "LIVE -- folders WILL be moved" })) `
+    -ForegroundColor $(if ($DryRun) { "Green" } else { "Red" })
+Write-Host ""
+if ($DryRun) {
+    Write-Host "  [DRY RUN] No folders will be moved." -ForegroundColor Yellow
+    Write-Host ""
+}
+
+# ==============================================================================
+# SCAN HDD GAME FOLDER
+# ==============================================================================
+Write-Host "Scanning HDD game folder..." -ForegroundColor Green
+
+$HddGames   = @{}
+$SkippedHdd = 0
+
+foreach ($Folder in (Get-ChildItem -LiteralPath $GamePath -Directory)) {
+    if ($Folder.Name -match '[-_](DATA|INSTALL|cache|GAMEDATA)$' -or
+        $Folder.Name -match '^\.' -or
+        $Folder.Name -eq '$locks') {
+        $SkippedHdd++
+        continue
     }
 
-    if (-not (Test-Path $DedupeDir)) {
+    $SfoPath = Find-ParamSfo -FolderPath $Folder.FullName -Type 'game'
+    if (-not $SfoPath) { $SkippedHdd++; continue }
+
+    $Sfo = Read-ParamSfo -SfoPath $SfoPath
+    if (-not $Sfo) { $SkippedHdd++; continue }
+
+    $Category = $Sfo['CATEGORY']
+    if ($Category -eq 'GD' -or $Category -eq 'SD' -or $Category -eq 'AS') {
+        $SkippedHdd++
+        continue
+    }
+
+    $TitleId = $Sfo['TITLE_ID']
+    if (-not $TitleId) { $TitleId = $Folder.Name }
+
+    if (-not $HddGames.ContainsKey($TitleId)) {
+        $HddGames[$TitleId] = [PSCustomObject]@{
+            TitleId    = $TitleId
+            Title      = $Sfo['TITLE']
+            Region     = Get-RegionFromTitleId -TitleId $TitleId
+            Category   = $Category
+            FolderName = $Folder.Name
+            FullPath   = $Folder.FullName
+        }
+    }
+}
+
+Write-Host ("  Found {0} HDD games  ({1} folders skipped as data/cache/DLC)" -f $HddGames.Count, $SkippedHdd) -ForegroundColor Gray
+Write-Host ""
+
+# ==============================================================================
+# SCAN DISC FOLDER
+# ==============================================================================
+Write-Host "Scanning disc folder..." -ForegroundColor Green
+
+$DiscGames   = @{}
+$SkippedDisc = 0
+
+foreach ($Folder in (Get-ChildItem -LiteralPath $DiscPath -Directory)) {
+    $SfoPath = Find-ParamSfo -FolderPath $Folder.FullName -Type 'disc'
+    if (-not $SfoPath) { $SkippedDisc++; continue }
+
+    $Sfo = Read-ParamSfo -SfoPath $SfoPath
+    if (-not $Sfo) { $SkippedDisc++; continue }
+
+    $TitleId = $Sfo['TITLE_ID']
+    if (-not $TitleId) { $TitleId = $Folder.Name }
+
+    if (-not $DiscGames.ContainsKey($TitleId)) {
+        $DiscGames[$TitleId] = [PSCustomObject]@{
+            TitleId    = $TitleId
+            Title      = $Sfo['TITLE']
+            Region     = Get-RegionFromTitleId -TitleId $TitleId
+            Category   = $Sfo['CATEGORY']
+            FolderName = $Folder.Name
+            FullPath   = $Folder.FullName
+        }
+    }
+}
+
+Write-Host ("  Found {0} disc games  ({1} folders skipped)" -f $DiscGames.Count, $SkippedDisc) -ForegroundColor Gray
+Write-Host ""
+
+# ==============================================================================
+# MATCH AND EVALUATE
+# ==============================================================================
+$Actions       = @()
+$MatchCount    = 0
+$DiscOnlyCount = 0
+$HddOnlyCount  = 0
+
+foreach ($TitleId in $DiscGames.Keys) {
+    $Disc = $DiscGames[$TitleId]
+
+    if ($HddGames.ContainsKey($TitleId)) {
+        $MatchCount++
+        $Hdd = $HddGames[$TitleId]
+        $Actions += [PSCustomObject]@{
+            TitleId      = $TitleId
+            Title        = $Disc.Title
+            DiscFolder   = $Disc.FolderName
+            HddFolder    = $Hdd.FolderName
+            Action       = if ($DryRun) { 'WouldMove' } else { 'Move' }
+            Reason       = 'HDD copy exists -- disc is duplicate'
+            DiscFullPath = $Disc.FullPath
+            Destination  = Join-Path $DedupeDir $Disc.FolderName
+        }
+    } else {
+        $DiscOnlyCount++
+        $Actions += [PSCustomObject]@{
+            TitleId      = $TitleId
+            Title        = $Disc.Title
+            DiscFolder   = $Disc.FolderName
+            HddFolder    = ''
+            Action       = 'Keep'
+            Reason       = 'No HDD copy -- disc is only copy'
+            DiscFullPath = $Disc.FullPath
+            Destination  = ''
+        }
+    }
+}
+
+foreach ($TitleId in $HddGames.Keys) {
+    if (-not $DiscGames.ContainsKey($TitleId)) {
+        $HddOnlyCount++
+        $Hdd = $HddGames[$TitleId]
+        $Actions += [PSCustomObject]@{
+            TitleId      = $TitleId
+            Title        = $Hdd.Title
+            DiscFolder   = ''
+            HddFolder    = $Hdd.FolderName
+            Action       = 'Keep'
+            Reason       = 'HDD only -- no disc copy'
+            DiscFullPath = ''
+            Destination  = ''
+        }
+    }
+}
+
+$ToMove = @($Actions | Where-Object { $_.Action -in @('Move','WouldMove') })
+$ToKeep = @($Actions | Where-Object { $_.Action -eq 'Keep' })
+
+Write-Host "------------------------------------------" -ForegroundColor Cyan
+Write-Host ("Disc + HDD duplicates found : {0}  (disc copies will be moved)" -f $MatchCount)
+Write-Host ("Disc only (no HDD copy)     : {0}  (kept)" -f $DiscOnlyCount)
+Write-Host ("HDD only  (no disc copy)    : {0}  (kept)" -f $HddOnlyCount)
+Write-Host "------------------------------------------" -ForegroundColor Cyan
+Write-Host ""
+
+# ==============================================================================
+# WRITE CSV LOG
+# ==============================================================================
+$Actions | Sort-Object Action, Title |
+    Export-Csv -LiteralPath $LogFile -NoTypeInformation -Encoding UTF8
+Write-Host ("Log saved: {0}" -f $LogFile) -ForegroundColor Green
+Write-Host ""
+
+# ==============================================================================
+# MOVE FOLDERS (live mode only)
+# ==============================================================================
+if (-not $DryRun -and $ToMove.Count -gt 0) {
+
+    if (-not (Test-Path -LiteralPath $DedupeDir)) {
         New-Item -Path $DedupeDir -ItemType Directory -Force | Out-Null
     }
 
-    # ── Scan HDD game folder ──────────────────────────────────────────────────
-    Write-Host "Scanning HDD game folder..." -ForegroundColor Green
+    $MoveIndex  = 0
+    $MoveErrors = 0
 
-    $hddGames = @{}
-    $hddFolders = Get-ChildItem -Path $GamePath -Directory
+    foreach ($Item in $ToMove) {
+        $MoveIndex++
+        Write-Host ("  Moving [{0}/{1}] {2}" -f $MoveIndex, $ToMove.Count, $Item.DiscFolder) -ForegroundColor DarkGray
 
-    $skippedHdd = 0
-
-    foreach ($folder in $hddFolders) {
-        # Skip obviously non-game folders
-        if ($folder.Name -match '[-_](DATA|INSTALL|cache|GAMEDATA)$' -or
-            $folder.Name -match '^\.' -or
-            $folder.Name -eq '$locks' -or
-            $folder.Name -eq '.locks') {
-            $skippedHdd++
-            continue
-        }
-
-        $sfoPath = Find-ParamSfo -FolderPath $folder.FullName -Type 'game'
-        if (-not $sfoPath) {
-            $skippedHdd++
-            continue
-        }
-
-        $sfo = Read-ParamSfo -SfoPath $sfoPath
-        if (-not $sfo) {
-            $skippedHdd++
-            continue
-        }
-
-        # Skip game data (CATEGORY = GD) and licence/system entries
-        $category = $sfo['CATEGORY']
-        if ($category -eq 'GD' -or $category -eq 'SD' -or $category -eq 'AS') {
-            $skippedHdd++
-            continue
-        }
-
-        $titleId = $sfo['TITLE_ID']
-        if (-not $titleId) { $titleId = $folder.Name }
-
-        $title  = $sfo['TITLE']
-        $region = Get-RegionFromTitleId -TitleId $titleId
-
-        if (-not $hddGames.ContainsKey($titleId)) {
-            $hddGames[$titleId] = [PSCustomObject]@{
-                TitleId    = $titleId
-                Title      = $title
-                Region     = $region
-                Category   = $category
-                FolderName = $folder.Name
-                FullPath   = $folder.FullName
-                Source     = 'HDD'
+        if (Test-Path -LiteralPath $Item.DiscFullPath) {
+            $DestPath = $Item.Destination
+            if (Test-Path -LiteralPath $DestPath) {
+                $DestPath = Join-Path $DedupeDir ("{0}__DUP_{1}" -f $Item.DiscFolder, (Get-Date -Format "yyyyMMddHHmmssfff"))
             }
-        }
-    }
 
-    Write-Host "  Found $($hddGames.Count) HDD games  ($skippedHdd folders skipped as data/cache/DLC)" -ForegroundColor Gray
-    Write-Host ""
-
-    # ── Scan disc folder ──────────────────────────────────────────────────────
-    Write-Host "Scanning disc folder..." -ForegroundColor Green
-
-    $discGames  = @{}
-    $discFolders = Get-ChildItem -Path $DiscPath -Directory
-    $skippedDisc = 0
-
-    foreach ($folder in $discFolders) {
-        $sfoPath = Find-ParamSfo -FolderPath $folder.FullName -Type 'disc'
-        if (-not $sfoPath) {
-            $skippedDisc++
-            continue
-        }
-
-        $sfo = Read-ParamSfo -SfoPath $sfoPath
-        if (-not $sfo) {
-            $skippedDisc++
-            continue
-        }
-
-        $category = $sfo['CATEGORY']
-        $titleId  = $sfo['TITLE_ID']
-        if (-not $titleId) { $titleId = $folder.Name }
-
-        $title  = $sfo['TITLE']
-        $region = Get-RegionFromTitleId -TitleId $titleId
-
-        if (-not $discGames.ContainsKey($titleId)) {
-            $discGames[$titleId] = [PSCustomObject]@{
-                TitleId    = $titleId
-                Title      = $title
-                Region     = $region
-                Category   = $category
-                FolderName = $folder.Name
-                FullPath   = $folder.FullName
-                Source     = 'Disc'
+            try {
+                Move-Item -LiteralPath $Item.DiscFullPath -Destination $DestPath -Force
             }
-        }
-    }
-
-    Write-Host "  Found $($discGames.Count) disc games  ($skippedDisc folders skipped)" -ForegroundColor Gray
-    Write-Host ""
-
-    # ── Match and evaluate ────────────────────────────────────────────────────
-    $actions        = @()
-    $matchCount     = 0
-    $discOnlyCount  = 0
-    $hddOnlyCount   = 0
-
-    # Check every disc game
-    foreach ($titleId in $discGames.Keys) {
-        $disc = $discGames[$titleId]
-
-        if ($hddGames.ContainsKey($titleId)) {
-            # Duplicate found — HDD wins
-            $matchCount++
-            $hdd = $hddGames[$titleId]
-
-            $actions += [PSCustomObject]@{
-                TitleId      = $titleId
-                Title        = $disc.Title
-                DiscFolder   = $disc.FolderName
-                HddFolder    = $hdd.FolderName
-                Action       = if ($DryRun) { 'WouldMove' } else { 'Move' }
-                Reason       = 'HDD copy exists — disc is duplicate'
-                DiscFullPath = $disc.FullPath
-                Destination  = Join-Path $DedupeDir $disc.FolderName
+            catch {
+                Write-Host ("    ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
+                $MoveErrors++
             }
+        } else {
+            Write-Host ("    SKIPPED (not found): {0}" -f $Item.DiscFolder) -ForegroundColor Yellow
         }
-        else {
-            $discOnlyCount++
-            $actions += [PSCustomObject]@{
-                TitleId      = $titleId
-                Title        = $disc.Title
-                DiscFolder   = $disc.FolderName
-                HddFolder    = ''
-                Action       = 'Keep'
-                Reason       = 'No HDD copy — disc is only copy'
-                DiscFullPath = $disc.FullPath
-                Destination  = ''
-            }
-        }
-    }
-
-    # HDD-only games (no disc copy) — just log them
-    foreach ($titleId in $hddGames.Keys) {
-        if (-not $discGames.ContainsKey($titleId)) {
-            $hddOnlyCount++
-            $hdd = $hddGames[$titleId]
-            $actions += [PSCustomObject]@{
-                TitleId      = $titleId
-                Title        = $hdd.Title
-                DiscFolder   = ''
-                HddFolder    = $hdd.FolderName
-                Action       = 'Keep'
-                Reason       = 'HDD only — no disc copy'
-                DiscFullPath = ''
-                Destination  = ''
-            }
-        }
-    }
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    $toMove = @($actions | Where-Object { $_.Action -in @('Move','WouldMove') })
-    $toKeep = @($actions | Where-Object { $_.Action -eq 'Keep' })
-
-    Write-Host "──────────────────────────────────────────" -ForegroundColor Cyan
-    Write-Host "Disc + HDD duplicates found : $matchCount  (disc copies will be moved)"
-    Write-Host "Disc only (no HDD copy)     : $discOnlyCount  (kept)"
-    Write-Host "HDD only  (no disc copy)    : $hddOnlyCount  (kept)"
-    Write-Host "──────────────────────────────────────────" -ForegroundColor Cyan
-    Write-Host ""
-
-    # ── Save CSV ──────────────────────────────────────────────────────────────
-    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $logFile   = Join-Path $PS3Root "PS3_DiscHDD_Dedup_$timestamp.csv"
-    $actions | Sort-Object Action, Title |
-        Export-Csv -Path $logFile -NoTypeInformation -Encoding UTF8
-    Write-Host "Log saved : $logFile" -ForegroundColor Green
-    Write-Host ""
-
-    # ── Move folders ──────────────────────────────────────────────────────────
-    if (-not $DryRun -and $toMove.Count -gt 0) {
-        $moveIndex  = 0
-        $moveErrors = 0
-
-        foreach ($item in $toMove) {
-            $moveIndex++
-            Write-Host "  Moving [$moveIndex/$($toMove.Count)] $($item.DiscFolder)" -ForegroundColor DarkGray
-
-            if (Test-Path $item.DiscFullPath) {
-                $destPath = $item.Destination
-
-                if (Test-Path $destPath) {
-                    $destPath = Join-Path $DedupeDir ("$($item.DiscFolder)__DUP_$(Get-Date -Format 'yyyyMMddHHmmssfff')")
-                }
-
-                try {
-                    Move-Item -Path $item.DiscFullPath -Destination $destPath -Force
-                }
-                catch {
-                    Write-Host "    ERROR: $($_.Exception.Message)" -ForegroundColor Red
-                    $moveErrors++
-                }
-            }
-            else {
-                Write-Host "    SKIPPED (not found): $($item.DiscFolder)" -ForegroundColor Yellow
-            }
-        }
-
-        Write-Host ""
-        if ($moveErrors -gt 0) {
-            Write-Host "Completed with $moveErrors error(s)." -ForegroundColor Yellow
-        }
-        else {
-            Write-Host "All folders moved successfully." -ForegroundColor Green
-        }
-    }
-
-    # ── Preview ───────────────────────────────────────────────────────────────
-    if ($toMove.Count -gt 0) {
-        Write-Host ""
-        Write-Host "Preview — $(if ($DryRun) { 'would move' } else { 'moved' }) disc folders (first 30):" -ForegroundColor Yellow
-        $toMove | Select-Object -First 30 Title, TitleId, DiscFolder, HddFolder, Reason |
-            Format-Table -AutoSize
-    }
-    else {
-        Write-Host "No disc/HDD duplicates found." -ForegroundColor Green
     }
 
     Write-Host ""
-    Write-Host "Done." -ForegroundColor Green
-    Write-Host ""
+    if ($MoveErrors -gt 0) {
+        Write-Host ("Completed with {0} error(s)." -f $MoveErrors) -ForegroundColor Yellow
+    } else {
+        Write-Host "All folders moved successfully." -ForegroundColor Green
+    }
 }
-catch {
+
+# ==============================================================================
+# PREVIEW
+# ==============================================================================
+if ($ToMove.Count -gt 0) {
     Write-Host ""
-    Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host ""
+    Write-Host ("Preview -- {0} disc folders (first 30):" -f $(if ($DryRun) { "would move" } else { "moved" })) -ForegroundColor Yellow
+    $ToMove | Select-Object -First 30 Title, TitleId, DiscFolder, HddFolder, Reason | Format-Table -AutoSize
+} else {
+    Write-Host "No disc/HDD duplicates found." -ForegroundColor Green
 }
+
+if ($DryRun) {
+    Write-Host ""
+    Write-Host "  DRY RUN complete. Set `$DryRun = `$false in the CONFIG block to apply." -ForegroundColor Yellow
+}
+
+Write-Host ""
+Write-Host "Done." -ForegroundColor Green
+Write-Host ""
+Set-ExitCode 0

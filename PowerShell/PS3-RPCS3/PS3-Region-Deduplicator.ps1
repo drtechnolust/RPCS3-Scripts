@@ -1,21 +1,69 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Identifies regional duplicate PS3 ZIP archives and moves lower-priority
+    copies to a destination folder.
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-$FileExtensions = @('*.zip')   # Add '*.iso', '*.pkg' if needed
-# ─────────────────────────────────────────────────────────────────────────────
+.DESCRIPTION
+    Scans a source folder for ZIP files (or other configured extensions),
+    groups files by normalized title (stripping region, version, and language
+    tags), selects the preferred copy based on region priority and version
+    number, and moves the rest to a destination folder.
+
+    Region priority (index 0 = highest):
+      USA > World > Europe > Japan > Asia > Korea > Hong Kong > Taiwan >
+      China > Singapore > Thailand > Australia > New Zealand > Canada >
+      UK > France > Germany > Italy > Spain > Netherlands > Norway >
+      Sweden > Denmark > Finland > Poland > Russia > Brazil > Mexico >
+      Latin America > Unknown
+
+    Version/revision selection: prefers higher version numbers when the
+    region score is tied (e.g. v2.01 beats v1.00).
+
+    Companion files are never treated as duplicates. These include files
+    tagged as: DLC, Add-On, Patch, Update, Demo, BIOS, Theme, and others.
+    Files smaller than $MinFullGameSizeMB are also treated as companions.
+
+    Run with DryRun mode (option 1) first to review the CSV log before
+    moving any files.
+
+.EXAMPLE
+    .\PS3-Region-Deduplicator.ps1
+
+.NOTES
+    Source and destination paths are entered interactively at startup.
+    The mode prompt (Dry Run / Live) is also interactive.
+
+    The CSV log is always written regardless of mode, making it safe to
+    review what will happen before running in Live mode.
+
+.VERSION
+    2.0.0 - MIT license, replaced Unicode dashes in output with ASCII.
+             Logic, companion detection, and CSV output unchanged.
+    1.0.0 - Initial release.
+
+.LICENSE
+    MIT License
+    Copyright (c) Paul Mardis
+#>
+
+# ==============================================================================
+# CONFIG
+# ==============================================================================
+# File types to scan for duplicates. Add '*.iso', '*.pkg' if needed.
+$FileExtensions = @('*.zip')
+
+# Files smaller than this (MB) are treated as companions, not full games.
+# Set to 0 to disable size-based companion detection.
+$MinFullGameSizeMB = 20
 
 $CompanionTags = @(
     'Unlock Key','PS2 Classics','PC Engine','Neo Geo',
-    'Alt','Sample','Demo','Kiosk','Proto',
-    'Debug','Program','BIOS','Theme',
-    'DLC','Add-On','Patch','Update','Expansion',
-    'Pack','Avatar','Dynamic Theme','Static Theme'
+    'Alt','Sample','Demo','Kiosk','Proto','Debug',
+    'Program','BIOS','Theme','DLC','Add-On','Patch',
+    'Update','Expansion','Pack','Avatar',
+    'Dynamic Theme','Static Theme'
 )
-
-# Files smaller than this (MB) are never treated as full game duplicates.
-# Patches and DLC are typically far smaller than full games.
-# Set to 0 to disable this check.
-$MinFullGameSizeMB = 20
 
 $KnownRegions = @(
     'USA','World','Europe','Japan','Asia','Korea',
@@ -35,344 +83,333 @@ $RegionPriority = @(
     'Norway','Sweden','Denmark','Finland','Poland',
     'Russia','Brazil','Mexico','Latin America','Unknown'
 )
-
-# ==============================================================================
-# FUNCTIONS
 # ==============================================================================
 
+function Set-ExitCode {
+    param([int]$Code)
+    $global:LASTEXITCODE = $Code
+}
+
+# ------------------------------------------------------------------------------
+# Companion detection
+# ------------------------------------------------------------------------------
 function Test-IsCompanionFile {
     param([string]$BaseName)
-    foreach ($tag in $CompanionTags) {
-        $escaped = [regex]::Escape($tag)
-        if ($BaseName -match "\($escaped(?:\s+[^)]+)?\)") { return $true }
+    foreach ($Tag in $CompanionTags) {
+        $Escaped = [regex]::Escape($Tag)
+        if ($BaseName -match "\($Escaped(?:\s+[^)]+)?\)") { return $true }
     }
     return $false
 }
 
+# ------------------------------------------------------------------------------
+# Region extraction
+# ------------------------------------------------------------------------------
 function Get-RegionFromName {
     param([string]$BaseName)
-    $m = [regex]::Matches($BaseName, '\(([^()]*)\)')
-    foreach ($match in $m) {
-        $token = $match.Groups[1].Value.Trim()
-        if ($KnownRegions -contains $token) { return $token }
+    $Matches = [regex]::Matches($BaseName, '\(([^()]*)\)')
+    foreach ($Match in $Matches) {
+        $Token = $Match.Groups[1].Value.Trim()
+        if ($KnownRegions -contains $Token) { return $Token }
     }
     return 'Unknown'
 }
 
+# ------------------------------------------------------------------------------
+# Normalized title key (strips region, version, language, revision tags)
+# ------------------------------------------------------------------------------
 function Get-NormalizedKey {
     param([string]$BaseName)
-    $result = $BaseName
 
-    # Strip region tags
-    foreach ($region in $KnownRegions) {
-        $escaped = [regex]::Escape($region)
-        $result = [regex]::Replace($result, "\s*\($escaped\)", '', 'IgnoreCase')
+    $Result = $BaseName
+
+    foreach ($Region in $KnownRegions) {
+        $Escaped = [regex]::Escape($Region)
+        $Result = [regex]::Replace($Result, "\s*\($Escaped\)", '', 'IgnoreCase')
     }
 
-    # Strip language tags: (En,Fr,De) / (En,Ja) etc.
-    $result = [regex]::Replace($result, '\s*\([A-Za-z]{2}(?:,[A-Za-z]{2})+\)', '')
+    $Result = [regex]::Replace($Result, '\s*\([A-Za-z]{2}(?:,[A-Za-z]{2})+\)', '')
+    $Result = [regex]::Replace($Result, '\s*\(v[\d]+\.[\d]+[^)]*\)', '', 'IgnoreCase')
+    $Result = [regex]::Replace($Result, '\s*\(Rev\s+[^)]+\)', '', 'IgnoreCase')
+    $Result = [regex]::Replace($Result, '\s*\(Version\s+[^)]+\)', '', 'IgnoreCase')
+    $Result = [regex]::Replace($Result, '\s+', ' ').Trim()
 
-    # Strip version tags: (v1.00), (v2.01)
-    $result = [regex]::Replace($result, '\s*\(v[\d]+\.[\d]+[^)]*\)', '', 'IgnoreCase')
-
-    # Strip revision tags: (Rev 1), (Rev A)
-    $result = [regex]::Replace($result, '\s*\(Rev\s+[^)]+\)', '', 'IgnoreCase')
-
-    # Strip (Version X) tags
-    $result = [regex]::Replace($result, '\s*\(Version\s+[^)]+\)', '', 'IgnoreCase')
-
-    # Normalize whitespace
-    $result = [regex]::Replace($result, '\s+', ' ').Trim()
-    return $result
+    return $Result
 }
 
+# ------------------------------------------------------------------------------
+# Version score (higher = newer)
+# ------------------------------------------------------------------------------
 function Get-VersionScore {
     param([string]$BaseName)
 
-    # (v1.00), (v2.01) etc.
-    $vMatch = [regex]::Match($BaseName, '\(v(\d+)\.(\d+)', 'IgnoreCase')
-    if ($vMatch.Success) {
-        $major = [int]$vMatch.Groups[1].Value
-        $minor = [int]$vMatch.Groups[2].Value
-        return ($major * 10000) + $minor
+    $VMatch = [regex]::Match($BaseName, '\(v(\d+)\.(\d+)', 'IgnoreCase')
+    if ($VMatch.Success) {
+        return ([int]$VMatch.Groups[1].Value * 10000) + [int]$VMatch.Groups[2].Value
     }
 
-    # (Rev 1), (Rev A) etc.
-    $rMatch = [regex]::Match($BaseName, '\(Rev\s+([^)]+)\)', 'IgnoreCase')
-    if ($rMatch.Success) {
-        $rev = $rMatch.Groups[1].Value.Trim()
-        $num = 0
-        if ([int]::TryParse($rev, [ref]$num)) { return $num }
-        if ($rev.Length -eq 1 -and $rev -match '[A-Za-z]') {
-            return [int][char]($rev.ToUpper()) - [int][char]'A' + 1
+    $RMatch = [regex]::Match($BaseName, '\(Rev\s+([^)]+)\)', 'IgnoreCase')
+    if ($RMatch.Success) {
+        $Rev = $RMatch.Groups[1].Value.Trim()
+        $Num = 0
+        if ([int]::TryParse($Rev, [ref]$Num)) { return $Num }
+        if ($Rev.Length -eq 1 -and $Rev -match '[A-Za-z]') {
+            return [int][char]($Rev.ToUpper()) - [int][char]'A' + 1
         }
     }
 
     return 0
 }
 
+# ------------------------------------------------------------------------------
+# Region score (lower index = higher priority)
+# ------------------------------------------------------------------------------
 function Get-RegionScore {
     param([string]$Region)
-    $idx = [array]::IndexOf($RegionPriority, $Region)
-    if ($idx -lt 0) { return 9999 }
-    return $idx
+    $Idx = [array]::IndexOf($RegionPriority, $Region)
+    if ($Idx -lt 0) { return 9999 }
+    return $Idx
 }
 
+# ------------------------------------------------------------------------------
+# Select the preferred file from a group
+# ------------------------------------------------------------------------------
 function Get-PreferredFile {
     param([array]$FilesInGroup)
+
     if ($FilesInGroup.Count -le 1) { return $FilesInGroup[0] }
 
-    # Sort: region priority ASC (lower = better), version score DESC (higher = newer)
-    $sorted = $FilesInGroup | Sort-Object -Property @(
-        @{ Expression = { Get-RegionScore  $_.Region   }; Ascending = $true  },
+    $Sorted = $FilesInGroup | Sort-Object -Property @(
+        @{ Expression = { Get-RegionScore $_.Region };   Ascending = $true  }
         @{ Expression = { Get-VersionScore $_.BaseName }; Ascending = $false }
     )
-    return $sorted[0]
+    return $Sorted[0]
 }
 
 # ==============================================================================
 # MAIN
 # ==============================================================================
-
 try {
-    Clear-Host
     Write-Host ""
-    Write-Host "PS3 Region Duplicate Organizer v2.0" -ForegroundColor Cyan
-    Write-Host "-------------------------------------" -ForegroundColor Cyan
+    Write-Host "PS3 Region Deduplicator" -ForegroundColor Cyan
+    Write-Host "=======================" -ForegroundColor Cyan
     Write-Host ""
 
-    # ── Prompt for source folder ──────────────────────────────────────────────
     Write-Host "Enter the full path to your SOURCE folder (containing ZIP files):" -ForegroundColor Yellow
-    $sourceFolder = (Read-Host "Source").Trim().Trim('"')
-
-    if (-not (Test-Path $sourceFolder -PathType Container)) {
-        throw "Source folder not found: $sourceFolder"
+    $SourceFolder = (Read-Host "Source").Trim().Trim('"')
+    if (-not (Test-Path -LiteralPath $SourceFolder -PathType Container)) {
+        throw "Source folder not found: $SourceFolder"
     }
 
-    # ── Prompt for destination folder ─────────────────────────────────────────
     Write-Host ""
     Write-Host "Enter the full path to your DESTINATION folder (where duplicates will be moved):" -ForegroundColor Yellow
-    $destinationFolder = (Read-Host "Destination").Trim().Trim('"')
+    $DestinationFolder = (Read-Host "Destination").Trim().Trim('"')
 
-    # ── Prompt for mode ───────────────────────────────────────────────────────
     Write-Host ""
     Write-Host "Select mode:" -ForegroundColor Yellow
-    Write-Host "  1 = Dry Run  (no files moved, just a report)"
+    Write-Host "  1 = Dry Run  (no files moved, report only)"
     Write-Host "  2 = Live     (actually move duplicate files)"
     Write-Host ""
-    $modeChoice = Read-Host "Enter 1 or 2"
-    if ($modeChoice -notmatch '^[12]$') { throw "Invalid choice. Enter 1 or 2." }
-    $dryRun = ($modeChoice -eq '1')
+    $ModeChoice = Read-Host "Enter 1 or 2"
+    if ($ModeChoice -notmatch '^[12]$') { throw "Invalid choice. Enter 1 or 2." }
+    $DryRun = ($ModeChoice -eq '1')
 
     Write-Host ""
-    Write-Host "Source      : $sourceFolder"      -ForegroundColor Yellow
-    Write-Host "Destination : $destinationFolder" -ForegroundColor Yellow
-    Write-Host "Mode        : $(if ($dryRun) { 'Dry Run — no files will be moved' } else { 'LIVE — files WILL be moved' })" -ForegroundColor $(if ($dryRun) { 'Green' } else { 'Red' })
+    Write-Host ("  Source      : {0}" -f $SourceFolder)      -ForegroundColor Yellow
+    Write-Host ("  Destination : {0}" -f $DestinationFolder) -ForegroundColor Yellow
+    Write-Host ("  Mode        : {0}" -f $(if ($DryRun) { "Dry Run -- no files will be moved" } else { "LIVE -- files WILL be moved" })) `
+        -ForegroundColor $(if ($DryRun) { "Green" } else { "Red" })
     Write-Host ""
 
-    if (-not (Test-Path $destinationFolder)) {
-        New-Item -Path $destinationFolder -ItemType Directory -Force | Out-Null
+    if (-not (Test-Path -LiteralPath $DestinationFolder)) {
+        New-Item -Path $DestinationFolder -ItemType Directory -Force | Out-Null
     }
 
-    # ── Collect files ─────────────────────────────────────────────────────────
-    $allFiles = @()
-    foreach ($ext in $FileExtensions) {
-        $allFiles += Get-ChildItem -Path $sourceFolder -File -Filter $ext
+    # Collect files
+    $AllFiles = @()
+    foreach ($Ext in $FileExtensions) {
+        $AllFiles += Get-ChildItem -LiteralPath $SourceFolder -File -Filter $Ext
     }
 
-    if (-not $allFiles -or $allFiles.Count -eq 0) {
-        throw "No matching files found in: $sourceFolder"
+    if (-not $AllFiles -or $AllFiles.Count -eq 0) {
+        throw "No matching files found in: $SourceFolder"
     }
 
-    Write-Host "Found $($allFiles.Count) file(s). Analyzing..." -ForegroundColor Green
+    Write-Host ("Found {0} file(s). Analyzing..." -f $AllFiles.Count) -ForegroundColor Green
     Write-Host ""
 
-    $fileObjects    = @()
-    $companionCount = 0
+    $FileObjects    = @()
+    $CompanionCount = 0
 
-    foreach ($file in $allFiles) {
-        $baseName      = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
-        $isCompanion   = Test-IsCompanionFile -BaseName $baseName
-        $region        = Get-RegionFromName   -BaseName $baseName
-        $normalizedKey = Get-NormalizedKey    -BaseName $baseName
+    foreach ($File in $AllFiles) {
+        $BaseName      = [System.IO.Path]::GetFileNameWithoutExtension($File.Name)
+        $IsCompanion   = Test-IsCompanionFile -BaseName $BaseName
+        $Region        = Get-RegionFromName   -BaseName $BaseName
+        $NormalizedKey = Get-NormalizedKey    -BaseName $BaseName
+        $FileSizeMB    = [math]::Round($File.Length / 1MB, 2)
 
-        # Also treat very small files as companions — patches/DLC/unlock keys
-        # are always much smaller than full games
-        if (-not $isCompanion -and $MinFullGameSizeMB -gt 0) {
-            $fileSizeMB = [math]::Round($file.Length / 1MB, 2)
-            if ($fileSizeMB -lt $MinFullGameSizeMB) { $isCompanion = $true }
+        if (-not $IsCompanion -and $MinFullGameSizeMB -gt 0 -and $FileSizeMB -lt $MinFullGameSizeMB) {
+            $IsCompanion = $true
         }
 
-        if ($isCompanion) { $companionCount++ }
+        if ($IsCompanion) { $CompanionCount++ }
 
-        $fileObjects += [PSCustomObject]@{
-            Name          = $file.Name
-            FullName      = $file.FullName
-            BaseName      = $baseName
-            Region        = $region
-            NormalizedKey = $normalizedKey
-            IsCompanion   = $isCompanion
-            SizeMB        = [math]::Round($file.Length / 1MB, 2)
+        $FileObjects += [PSCustomObject]@{
+            Name          = $File.Name
+            FullName      = $File.FullName
+            BaseName      = $BaseName
+            Region        = $Region
+            NormalizedKey = $NormalizedKey
+            IsCompanion   = $IsCompanion
+            SizeMB        = $FileSizeMB
         }
     }
 
-    # ── Stats ─────────────────────────────────────────────────────────────────
-    $gameFiles       = @($fileObjects | Where-Object { -not $_.IsCompanion })
-    $grouped         = $gameFiles | Group-Object -Property NormalizedKey
-    $uniqueTitles    = ($grouped | Where-Object { $_.Count -eq 1 }).Count
-    $duplicateGroups = ($grouped | Where-Object { $_.Count -gt 1 }).Count
+    $GameFiles       = @($FileObjects | Where-Object { -not $_.IsCompanion })
+    $Grouped         = $GameFiles | Group-Object -Property NormalizedKey
+    $UniqueTitles    = ($Grouped | Where-Object { $_.Count -eq 1 }).Count
+    $DuplicateGroups = ($Grouped | Where-Object { $_.Count -gt 1 }).Count
 
-    Write-Host "Companion/special files (always kept) : $companionCount"
-    Write-Host "Unique titles (no duplicates found)   : $uniqueTitles"
-    Write-Host "Titles with regional duplicates       : $duplicateGroups"
+    Write-Host ("Companion/special files (always kept) : {0}" -f $CompanionCount)
+    Write-Host ("Unique titles (no duplicates found)   : {0}" -f $UniqueTitles)
+    Write-Host ("Titles with regional duplicates       : {0}" -f $DuplicateGroups)
     Write-Host ""
 
-    # ── Evaluate groups ───────────────────────────────────────────────────────
-    $actions = @()
+    $Actions = @()
 
-    foreach ($group in $grouped) {
-        $groupFiles = @($group.Group)
+    foreach ($Group in $Grouped) {
+        $GroupFiles = @($Group.Group)
 
-        if ($groupFiles.Count -le 1) {
-            $actions += [PSCustomObject]@{
-                NormalizedKey = $group.Name
-                FileName      = $groupFiles[0].Name
-                Region        = $groupFiles[0].Region
-                SizeMB        = $groupFiles[0].SizeMB
+        if ($GroupFiles.Count -le 1) {
+            $Actions += [PSCustomObject]@{
+                NormalizedKey = $Group.Name
+                FileName      = $GroupFiles[0].Name
+                Region        = $GroupFiles[0].Region
+                SizeMB        = $GroupFiles[0].SizeMB
                 Action        = 'Keep'
                 Reason        = 'Only copy'
-                SourcePath    = $groupFiles[0].FullName
+                SourcePath    = $GroupFiles[0].FullName
                 Destination   = ''
             }
             continue
         }
 
-        $winner = Get-PreferredFile -FilesInGroup $groupFiles
+        $Winner = Get-PreferredFile -FilesInGroup $GroupFiles
 
-        foreach ($item in $groupFiles) {
-            $isWinner = ($item.FullName -eq $winner.FullName)
-            $actions += [PSCustomObject]@{
-                NormalizedKey = $group.Name
-                FileName      = $item.Name
-                Region        = $item.Region
-                SizeMB        = $item.SizeMB
-                Action        = if ($isWinner) { 'Keep' } elseif ($dryRun) { 'WouldMove' } else { 'Move' }
-                Reason        = if ($isWinner) { 'Best region/version' } else { 'Lower priority duplicate' }
-                SourcePath    = $item.FullName
-                Destination   = if ($isWinner) { '' } else { Join-Path $destinationFolder $item.Name }
+        foreach ($Item in $GroupFiles) {
+            $IsWinner = ($Item.FullName -eq $Winner.FullName)
+            $Actions += [PSCustomObject]@{
+                NormalizedKey = $Group.Name
+                FileName      = $Item.Name
+                Region        = $Item.Region
+                SizeMB        = $Item.SizeMB
+                Action        = if ($IsWinner) { 'Keep' } elseif ($DryRun) { 'WouldMove' } else { 'Move' }
+                Reason        = if ($IsWinner) { 'Best region/version' } else { 'Lower priority duplicate' }
+                SourcePath    = $Item.FullName
+                Destination   = if ($IsWinner) { '' } else { Join-Path $DestinationFolder $Item.Name }
             }
         }
     }
 
-    # Log companion files as Keep entries
-    foreach ($c in ($fileObjects | Where-Object { $_.IsCompanion })) {
-        $actions += [PSCustomObject]@{
-            NormalizedKey = $c.NormalizedKey
-            FileName      = $c.Name
-            Region        = $c.Region
-            SizeMB        = $c.SizeMB
+    foreach ($C in ($FileObjects | Where-Object { $_.IsCompanion })) {
+        $Actions += [PSCustomObject]@{
+            NormalizedKey = $C.NormalizedKey
+            FileName      = $C.Name
+            Region        = $C.Region
+            SizeMB        = $C.SizeMB
             Action        = 'Keep'
-            Reason        = 'Companion — excluded from dedup'
-            SourcePath    = $c.FullName
+            Reason        = 'Companion -- excluded from dedup'
+            SourcePath    = $C.FullName
             Destination   = ''
         }
     }
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    $toMove   = @($actions | Where-Object { $_.Action -in @('WouldMove','Move') })
-    $toKeep   = @($actions | Where-Object { $_.Action -eq 'Keep' })
-    $moveSize = [math]::Round(($toMove | Measure-Object -Property SizeMB -Sum).Sum / 1024, 2)
+    $ToMove   = @($Actions | Where-Object { $_.Action -in @('WouldMove','Move') })
+    $ToKeep   = @($Actions | Where-Object { $_.Action -eq 'Keep' })
+    $MoveSize = [math]::Round(($ToMove | Measure-Object -Property SizeMB -Sum).Sum / 1024, 2)
 
-    Write-Host "──────────────────────────────────────" -ForegroundColor Cyan
-    Write-Host "Files to keep : $($toKeep.Count)"
-    Write-Host "Files to move : $($toMove.Count)  (~$moveSize GB)"
-    Write-Host "──────────────────────────────────────" -ForegroundColor Cyan
+    Write-Host "--------------------------------------" -ForegroundColor Cyan
+    Write-Host ("Files to keep : {0}" -f $ToKeep.Count)
+    Write-Host ("Files to move : {0}  (~{1} GB)" -f $ToMove.Count, $MoveSize)
+    Write-Host "--------------------------------------" -ForegroundColor Cyan
     Write-Host ""
 
-    # ── Save CSV log ──────────────────────────────────────────────────────────
-    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $logFile   = Join-Path $sourceFolder "PS3_DuplicateLog_$timestamp.csv"
-    $actions | Sort-Object NormalizedKey, Action |
-        Export-Csv -Path $logFile -NoTypeInformation -Encoding UTF8
-    Write-Host "Log saved : $logFile" -ForegroundColor Green
+    # Always write CSV log
+    $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $LogFile   = Join-Path $SourceFolder ("PS3_DuplicateLog_{0}.csv" -f $Timestamp)
+    $Actions | Sort-Object NormalizedKey, Action |
+        Export-Csv -LiteralPath $LogFile -NoTypeInformation -Encoding UTF8
+    Write-Host ("Log saved: {0}" -f $LogFile) -ForegroundColor Green
     Write-Host ""
 
-    # ── Move files ────────────────────────────────────────────────────────────
-    $lockedFiles = @()
+    # Move files (live mode only)
+    $LockedFiles = @()
 
-    if (-not $dryRun -and $toMove.Count -gt 0) {
-        $moveIndex   = 0
-        $movedCount  = 0
-        $skippedCount = 0
+    if (-not $DryRun -and $ToMove.Count -gt 0) {
+        $MoveIndex    = 0
+        $MovedCount   = 0
+        $SkippedCount = 0
 
-        foreach ($item in $toMove) {
-            $moveIndex++
-            Write-Host "  Moving [$moveIndex/$($toMove.Count)] $($item.FileName)" -ForegroundColor DarkGray
+        foreach ($Item in $ToMove) {
+            $MoveIndex++
+            Write-Host ("  Moving [{0}/{1}] {2}" -f $MoveIndex, $ToMove.Count, $Item.FileName) -ForegroundColor DarkGray
 
-            if (-not (Test-Path $item.SourcePath)) {
-                Write-Host "    SKIPPED (not found): $($item.FileName)" -ForegroundColor Yellow
-                $skippedCount++
+            if (-not (Test-Path -LiteralPath $Item.SourcePath)) {
+                Write-Host ("    SKIPPED (not found): {0}" -f $Item.FileName) -ForegroundColor Yellow
+                $SkippedCount++
                 continue
             }
 
-            $destPath = $item.Destination
-
-            # Resolve filename collision at destination
-            if (Test-Path $destPath) {
-                $base     = [System.IO.Path]::GetFileNameWithoutExtension($item.FileName)
-                $ext      = [System.IO.Path]::GetExtension($item.FileName)
-                $destPath = Join-Path $destinationFolder ("{0}__DUP_{1}{2}" -f $base, (Get-Date -Format "yyyyMMddHHmmssfff"), $ext)
+            $DestPath = $Item.Destination
+            if (Test-Path -LiteralPath $DestPath) {
+                $Base     = [System.IO.Path]::GetFileNameWithoutExtension($Item.FileName)
+                $Ext      = [System.IO.Path]::GetExtension($Item.FileName)
+                $DestPath = Join-Path $DestinationFolder ("{0}__DUP_{1}{2}" -f $Base, (Get-Date -Format "yyyyMMddHHmmssfff"), $Ext)
             }
 
             try {
-                Move-Item -Path $item.SourcePath -Destination $destPath -Force
-                $movedCount++
+                Move-Item -LiteralPath $Item.SourcePath -Destination $DestPath -Force
+                $MovedCount++
             }
             catch {
-                $errMsg = $_.Exception.Message
-                Write-Host "    LOCKED — skipping: $($item.FileName)" -ForegroundColor Yellow
-                Write-Host "    Reason : $errMsg" -ForegroundColor DarkGray
-                $lockedFiles += [PSCustomObject]@{
-                    FileName   = $item.FileName
-                    Region     = $item.Region
-                    SizeMB     = $item.SizeMB
-                    SourcePath = $item.SourcePath
-                    Error      = $errMsg
+                $ErrMsg = $_.Exception.Message
+                Write-Host ("    LOCKED -- skipping: {0}" -f $Item.FileName) -ForegroundColor Yellow
+                $LockedFiles += [PSCustomObject]@{
+                    FileName   = $Item.FileName
+                    Region     = $Item.Region
+                    SizeMB     = $Item.SizeMB
+                    SourcePath = $Item.SourcePath
+                    Error      = $ErrMsg
                 }
             }
         }
 
         Write-Host ""
-        Write-Host "──────────────────────────────────────" -ForegroundColor Cyan
-        Write-Host "Moved successfully : $movedCount"
-        if ($lockedFiles.Count -gt 0) {
-            Write-Host "Locked (in use)    : $($lockedFiles.Count)  — see LOCKED log below" -ForegroundColor Yellow
+        Write-Host "--------------------------------------" -ForegroundColor Cyan
+        Write-Host ("Moved successfully : {0}" -f $MovedCount)
+        if ($LockedFiles.Count -gt 0) {
+            Write-Host ("Locked (in use)    : {0}" -f $LockedFiles.Count) -ForegroundColor Yellow
         }
-        if ($skippedCount -gt 0) {
-            Write-Host "Skipped (missing)  : $skippedCount" -ForegroundColor DarkGray
+        if ($SkippedCount -gt 0) {
+            Write-Host ("Skipped (missing)  : {0}" -f $SkippedCount) -ForegroundColor DarkGray
         }
-        Write-Host "──────────────────────────────────────" -ForegroundColor Cyan
+        Write-Host "--------------------------------------" -ForegroundColor Cyan
 
-        # Write locked-file log
-        if ($lockedFiles.Count -gt 0) {
-            $lockedLog = Join-Path $sourceFolder "PS3_LockedFiles_$timestamp.csv"
-            $lockedFiles | Export-Csv -Path $lockedLog -NoTypeInformation -Encoding UTF8
+        if ($LockedFiles.Count -gt 0) {
+            $LockedLog = Join-Path $SourceFolder ("PS3_LockedFiles_{0}.csv" -f $Timestamp)
+            $LockedFiles | Export-Csv -LiteralPath $LockedLog -NoTypeInformation -Encoding UTF8
             Write-Host ""
-            Write-Host "Locked file log : $lockedLog" -ForegroundColor Yellow
-            Write-Host "Close LaunchBox (or whatever has these open) and re-run with -Live to retry." -ForegroundColor Yellow
-            Write-Host ""
-            Write-Host "Locked files:" -ForegroundColor Yellow
-            $lockedFiles | Select-Object FileName, Region, SizeMB | Format-Table -AutoSize
+            Write-Host ("Locked file log: {0}" -f $LockedLog) -ForegroundColor Yellow
+            Write-Host "Close LaunchBox (or whatever has these files open) and re-run in Live mode to retry." -ForegroundColor Yellow
         }
     }
 
-    # ── Preview ───────────────────────────────────────────────────────────────
-    if ($toMove.Count -gt 0) {
+    if ($ToMove.Count -gt 0) {
         Write-Host ""
-        Write-Host "Preview — $(if ($dryRun) { 'would move' } else { 'moved' }) (first 30):" -ForegroundColor Yellow
-        $toMove | Select-Object -First 30 FileName, Region, SizeMB, Reason | Format-Table -AutoSize
+        Write-Host ("Preview -- {0} (first 30):" -f $(if ($DryRun) { "would move" } else { "moved" })) -ForegroundColor Yellow
+        $ToMove | Select-Object -First 30 FileName, Region, SizeMB, Reason | Format-Table -AutoSize
     } else {
-        Write-Host "No duplicates found — nothing to move." -ForegroundColor Green
+        Write-Host "No duplicates found -- nothing to move." -ForegroundColor Green
     }
 
     Write-Host ""
@@ -381,6 +418,7 @@ try {
 }
 catch {
     Write-Host ""
-    Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host ("Error: {0}" -f $_.Exception.Message) -ForegroundColor Red
     Write-Host ""
+    Set-ExitCode 1
 }

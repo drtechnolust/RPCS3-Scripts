@@ -43,6 +43,13 @@
     Path to 7z.exe.
 .PARAMETER FolderPollSeconds
     How long (seconds) to keep polling for a new game folder after each PKG install.
+
+.NOTES
+    PowerShell 7 or later required.
+
+.LICENSE
+    MIT License
+    Copyright (c) Paul Mardis
 #>
 param(
     [string] $SourceRoot        = 'D:\Arcade\System roms\Sony Playstation 3\Sony - PlayStation 3 (PSN) (Content)',

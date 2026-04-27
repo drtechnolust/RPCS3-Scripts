@@ -1,62 +1,68 @@
 #Requires -Version 7.0
 <#
-===============================================================================
-  SCRIPT   : RPCS3-Batch-Installer.ps1
-  AUTHOR   : Paul Mardis
-  CREATED  : 2025
-  VERSION  : 1.0
-  GITHUB   : https://github.com/drtechnolust/RPCS3-Scripts
+.SYNOPSIS
+    Fully automated PS3 PKG batch installer for RPCS3 (PowerShell 7+ required).
 
-===============================================================================
-  COPYRIGHT & LICENSE
-===============================================================================
-  Copyright (c) 2025 Paul Mardis. All rights reserved.
+.DESCRIPTION
+    Processes ZIP archives and loose folders containing PS3 PKG and RAP files,
+    installs them through RPCS3, tracks installation state by SHA-256 hash,
+    organises archives into _Installed/_Failed folders, and auto-handles
+    RPCS3 UI dialogs so the entire batch runs hands-free.
 
-  This script is the original work of Paul Mardis and is provided for
-  personal, non-commercial use only.
+    Features:
+      - Supports ZIPs and loose PKG folders as input sources
+      - Four run modes: Normal, Dry Run, Force Reinstall, Retry Failed
+      - SHA-256 state tracking prevents duplicate installs across sessions
+      - Automated UI interaction via Windows UI Automation (no SendKeys hacks)
+      - Auto-cancels the Loading games dialog to speed up installs
+      - Auto-unchecks Precompile caches checkbox for faster processing
+      - Auto-clicks Install and OK buttons without user intervention
+      - Matches RAP license files to their PKG and copies to RPCS3 exdata
+      - Moves processed archives to _Installed or _Failed automatically
+      - Full CSV log with timestamps, paths, exit codes, and game folders
+      - Batch limit support to process a defined number of items per run
+      - Pre-flight checks for RPCS3, 7-Zip, and game folder existence
+      - Detects and optionally kills existing RPCS3 instances before running
 
-  You MAY:
-    - Use this script for your own personal PS3/RPCS3 setup
-    - Share it with others provided this full header remains intact and
-      credit is clearly given to the original author: Paul Mardis
+    Designed for use with LaunchBox + RPCS3 on Windows.
+    REQUIREMENTS: PowerShell 7+, 7-Zip, Windows UI Automation assembly.
 
-  You MAY NOT:
-    - Remove or alter this copyright notice or author attribution
-    - Redistribute this script as your own work
-    - Include this script in paid tools, packages, or products without
-      explicit written permission from Paul Mardis
-    - Claim authorship or creation of this script
+.PARAMETER SourceRoot
+    Folder containing ZIP archives or loose PKG folders to install.
 
-  If you share or repost this script anywhere (GitHub, Reddit, forums,
-  YouTube descriptions, Discord, etc.) you MUST credit:
-    Paul Mardis — https://github.com/drtechnolust
+.PARAMETER Rpcs3Exe
+    Full path to rpcs3.exe.
 
-===============================================================================
-  DESCRIPTION
-===============================================================================
-  A fully automated PS3 PKG batch installer for RPCS3 (PowerShell 7+).
-  Processes ZIP archives and loose folders containing PS3 PKG/RAP files,
-  installs them via RPCS3, tracks installation state by SHA-256 hash,
-  organises archives into _Installed/_Failed folders, and auto-handles
-  RPCS3 UI dialogs so the entire process runs hands-free.
+.PARAMETER Rpcs3Root
+    RPCS3 root folder (contains dev_hdd0, etc.).
 
-  Features:
-    - Supports ZIPs and loose PKG folders as input sources
-    - Four run modes: Normal, Dry Run, Force Reinstall, Retry Failed
-    - SHA-256 state tracking prevents duplicate installs across sessions
-    - Automated UI interaction via Windows UI Automation (no SendKeys hacks)
-    - Auto-cancels the Loading games dialog to speed up installs
-    - Auto-unchecks Precompile caches checkbox for faster processing
-    - Auto-clicks Install and OK buttons without user intervention
-    - Matches RAP license files to their PKG and copies them to RPCS3 exdata
-    - Moves processed archives to _Installed or _Failed automatically
-    - Full CSV log with timestamps, paths, exit codes, and detected game folders
-    - Batch limit support to process a defined number of items per run
-    - Pre-flight checks for RPCS3, 7-Zip, and game folder existence
-    - Detects and optionally kills existing RPCS3 instances before running
-  Designed for use with LaunchBox + RPCS3 on Windows.
+.PARAMETER TempRoot
+    Temporary working folder for extraction. Cleaned up after each item.
 
-===============================================================================
+.PARAMETER SevenZipExe
+    Full path to 7z.exe.
+
+.PARAMETER FolderPollSeconds
+    Seconds to wait between polling RPCS3 for a newly installed game folder.
+
+.EXAMPLE
+    .\RPCS3-Batch-Installer.ps1
+
+.EXAMPLE
+    .\RPCS3-Batch-Installer.ps1 -SourceRoot "D:\PS3\Queue" -Rpcs3Exe "C:\RPCS3\rpcs3.exe"
+
+.NOTES
+    PowerShell 7 or later required. Run mode selected interactively at startup.
+
+.VERSION
+    1.1.0 - Switched to MIT license. Replaced box-drawing and emoji with ASCII.
+            Added standard help block and version history.
+    1.0.0 - Initial release. Full UI automation, SHA-256 state, CSV log,
+            four run modes, RAP file matching, ZIP extraction.
+
+.LICENSE
+    MIT License
+    Copyright (c) Paul Mardis
 #>
 
 param(
@@ -71,13 +77,13 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# ── UTF-8 console output ─────────────────────────────────────────────────────
+# -- UTF-8 console output -----------------------------------------------------
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $OutputEncoding           = [System.Text.UTF8Encoding]::new($false)
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 #  DERIVED PATHS
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 $GameRoot      = Join-Path $Rpcs3Root 'dev_hdd0\game'
 $RapTargetRoot = Join-Path $Rpcs3Root 'dev_hdd0\home\00000001\exdata'
 $PS3Root       = 'D:\Arcade\System roms\Sony Playstation 3'
@@ -87,14 +93,14 @@ $FailedRoot    = Join-Path $PS3Root   '_Failed'
 $LogFile       = Join-Path $StateRoot 'install_log.csv'
 $StateFile     = Join-Path $StateRoot 'installed_state.json'
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 #  BANNER + INTERACTIVE RUN-TYPE PROMPT
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 function Show-Banner {
     Write-Host ''
-    Write-Host '╔══════════════════════════════════════════════════════╗' -ForegroundColor Cyan
-    Write-Host '║          RPCS3 Batch PKG Installer  (PS7)            ║' -ForegroundColor Cyan
-    Write-Host '╚══════════════════════════════════════════════════════╝' -ForegroundColor Cyan
+    Write-Host '======================================================' -ForegroundColor Cyan
+    Write-Host '  RPCS3 Batch PKG Installer  (PS7)' -ForegroundColor Cyan
+    Write-Host '======================================================' -ForegroundColor Cyan
     Write-Host ''
 }
 
@@ -144,9 +150,9 @@ Write-Host '  RPCS3    : ' -NoNewline -ForegroundColor Gray; Write-Host $Rpcs3Ex
 Write-Host '  7-Zip    : ' -NoNewline -ForegroundColor Gray; Write-Host $SevenZipExe -ForegroundColor Cyan
 Write-Host ''
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 #  HELPER FUNCTIONS
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 
 function Initialize-Folder ([string] $Path) {
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -280,7 +286,7 @@ function Expand-WithSevenZip ([string] $ArchivePath, [string] $DestinationPath) 
     if ($LASTEXITCODE -ne 0) { throw "7-Zip exited with code $LASTEXITCODE" }
 }
 
-# ── Load UI Automation + Win32 APIs ──────────────────────────────────────────
+# -- Load UI Automation + Win32 APIs ------------------------------------------
 Add-Type -AssemblyName UIAutomationClient   -ErrorAction SilentlyContinue
 Add-Type -AssemblyName UIAutomationTypes    -ErrorAction SilentlyContinue
 Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
@@ -327,11 +333,11 @@ public static class RPCS3Win32 {
 '@ -ErrorAction SilentlyContinue
 }
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 #  RPCS3 INSTALL  —  UI Automation, no SendKeys focus issues
 #  FIX: $progressConfirmed prevents grace-period firing during the gap
 #       between the dialog closing and the progress bar appearing
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 function Invoke-RPCS3Install {
     param(
         [string] $PkgPath,
@@ -359,7 +365,7 @@ function Invoke-RPCS3Install {
         Start-Sleep -Milliseconds 600
         if ($proc.HasExited) { break }
 
-        # ── Auto-cancel "Loading games" that appears before the PKG dialog ───
+        # -- Auto-cancel "Loading games" that appears before the PKG dialog ---
         $hwndLoading = [RPCS3Win32]::FindWindow([IntPtr]::Zero, 'Loading games')
         if ($hwndLoading -ne [IntPtr]::Zero -and [RPCS3Win32]::IsWindowVisible($hwndLoading)) {
             Write-Host "`r    [+] Auto-canceling 'Loading games' to save time...             " `
@@ -383,7 +389,7 @@ function Invoke-RPCS3Install {
             continue
         }
 
-        # ── PKG Installation dialog ──────────────────────────────────────────
+        # -- PKG Installation dialog ------------------------------------------
         $hwndInstall = [RPCS3Win32]::FindWindow([IntPtr]::Zero, 'PKG Installation')
         if ($hwndInstall -ne [IntPtr]::Zero -and [RPCS3Win32]::IsWindowVisible($hwndInstall)) {
 
@@ -449,7 +455,7 @@ function Invoke-RPCS3Install {
                 } catch {}
             }
 
-            # ── POST-INSTALL WATCHER ─────────────────────────────────────────
+            # -- POST-INSTALL WATCHER -----------------------------------------
             # FIX: $progressConfirmed — the grace-period counter only starts
             # AFTER the progress bar has been seen at least once. This prevents
             # the 1-3 second gap between the dialog closing and the progress bar
@@ -570,9 +576,9 @@ function Invoke-RPCS3Install {
     return 0
 }
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 #  OUTPUT HELPERS
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 function Write-ProgressLine ([int] $Current, [int] $Total, [string] $ZipName) {
     $pct  = [math]::Floor(($Current / $Total) * 100)
     $done = [math]::Floor($pct / 5)
@@ -586,9 +592,9 @@ function Write-StatusLine ([string] $Icon, [string] $Color, [string] $Label, [st
     Write-Host ('  {0} {1,-12} {2}' -f $Icon, $Label, $Detail) -ForegroundColor $Color
 }
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 #  PRE-FLIGHT CHECKS
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 foreach ($check in @(
     @{ Path = $Rpcs3Exe;    Label = 'RPCS3 executable' }
     @{ Path = $SevenZipExe; Label = '7-Zip executable'  }
@@ -604,9 +610,9 @@ foreach ($dir in @($StateRoot, $InstalledRoot, $FailedRoot, $TempRoot, $RapTarge
     Initialize-Folder -Path $dir
 }
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 #  LOAD STATE & COLLECT WORK ITEMS
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 $state    = Import-State
 $scanRoot = $RetryFailed ? $FailedRoot : $SourceRoot
 
@@ -614,7 +620,7 @@ $skipFolderNames = @('_DeDuplication','_Installed','_Failed','_Automation','Comp
 $workItems = [System.Collections.Generic.List[pscustomobject]]::new()
 
 if ($scanZips) {
-    Write-Host '  🔍 Scanning for ZIP archives...' -ForegroundColor DarkYellow
+    Write-Host '  [SCAN] Scanning for ZIP archives...' -ForegroundColor DarkYellow
     $zips = Get-ChildItem -LiteralPath $scanRoot -Recurse -File -Filter *.zip |
         Where-Object {
             $_.FullName -notmatch '\\_installed\\'  -and
@@ -624,7 +630,7 @@ if ($scanZips) {
 
     foreach ($z in $zips) {
         if ($batchLimit -gt 0 -and $workItems.Count -ge $batchLimit) {
-            Write-Host '  ⚠ Batch limit reached. Stopping ZIP scan early.' -ForegroundColor DarkYellow
+            Write-Host '  [!] Batch limit reached. Stopping ZIP scan early.' -ForegroundColor DarkYellow
             break
         }
         $workItems.Add([pscustomobject] @{
@@ -637,13 +643,13 @@ if ($scanZips) {
 }
 
 if ($scanFolders -and ($batchLimit -eq 0 -or $workItems.Count -lt $batchLimit)) {
-    Write-Host '  🔍 Scanning for folders with PKGs...' -ForegroundColor DarkYellow
+    Write-Host '  [SCAN] Scanning for folders with PKGs...' -ForegroundColor DarkYellow
     $dirs = Get-ChildItem -LiteralPath $scanRoot -Directory |
         Where-Object { $_.Name -notin $skipFolderNames -and $_.Name -notmatch '^_' }
 
     foreach ($d in $dirs) {
         if ($batchLimit -gt 0 -and $workItems.Count -ge $batchLimit) {
-            Write-Host '  ⚠ Batch limit reached. Stopping folder scan early.' -ForegroundColor DarkYellow
+            Write-Host '  [!] Batch limit reached. Stopping folder scan early.' -ForegroundColor DarkYellow
             break
         }
         $hasPkg = [bool](Get-ChildItem -LiteralPath $d.FullName -Recurse -File -Filter *.pkg `
@@ -677,7 +683,7 @@ Write-Host ''
 
 $existingRpcs3 = Get-Process -Name 'rpcs3' -ErrorAction SilentlyContinue
 if ($existingRpcs3) {
-    Write-Host '  ⚠  RPCS3 is already running.' -ForegroundColor Yellow
+    Write-Host '  [!]  RPCS3 is already running.' -ForegroundColor Yellow
     Write-Host '     The installer cannot run alongside an open RPCS3 instance.' -ForegroundColor Yellow
     $kill = (Read-Host '     Kill it now and continue? [Y/N]').Trim().ToUpper()
     if ($kill -eq 'Y') {
@@ -694,9 +700,9 @@ Write-Host ''
 $counters    = @{ Success = 0; Skipped = 0; Failed = 0; Error = 0 }
 $failedItems = [System.Collections.Generic.List[pscustomobject]]::new()
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 #  MAIN LOOP
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 $idx = 0
 foreach ($item in $workItems) {
     $idx++
@@ -725,7 +731,7 @@ foreach ($item in $workItems) {
     # Skip if already recorded in state file (Normal mode)
     if (-not $ForceReinstall -and -not $RetryFailed -and $itemHash -and $state.ContainsKey($itemHash)) {
         $cachedFolder = $state[$itemHash]?['DetectedGameFolder'] ?? ''
-        Write-StatusLine -Icon '⏭' -Color DarkGray -Label 'SKIPPED' -Detail $dispName
+        Write-StatusLine -Icon '[SKIP]' -Color DarkGray -Label 'SKIPPED' -Detail $dispName
         $counters.Skipped++
         Write-LogRow -ArchivePath $sourcePath -PkgPath '' -RapPath '' -Status 'Skipped' `
             -Details 'Already in state file' -DetectedGameFolder $cachedFolder -ExitCode 0
@@ -737,7 +743,7 @@ foreach ($item in $workItems) {
 
     try {
         Write-Host ''
-        Write-Host ("  ── [{0}/{1}] {2}  [{3}]" -f $idx, $total, $dispName, $typeLabel) -ForegroundColor White
+        Write-Host ("  -- [{0}/{1}] {2}  [{3}]" -f $idx, $total, $dispName, $typeLabel) -ForegroundColor White
 
         if ($isZip) {
             $workFolder   = Join-Path $TempRoot $dispName
@@ -747,9 +753,9 @@ foreach ($item in $workItems) {
             Remove-FolderSafe   -Path $workFolder
             Initialize-Folder   -Path $workFolder
             Expand-WithSevenZip -ArchivePath $sourcePath -DestinationPath $workFolder
-            Write-Host '  ✔  Extraction complete' -ForegroundColor DarkGreen
+            Write-Host '  [OK] Extraction complete' -ForegroundColor DarkGreen
         } else {
-            Write-Host '  ✔  STAGE 1/3  Using folder directly (no extraction needed)' -ForegroundColor DarkGreen
+            Write-Host '  [OK] STAGE 1/3  Using folder directly' -ForegroundColor DarkGreen
         }
 
         # @() guarantees an array even when Get-ChildItem returns $null (StrictMode safe)
@@ -759,7 +765,7 @@ foreach ($item in $workItems) {
         Write-Host ("    Found: {0} PKG, {1} RAP" -f $pkgFiles.Count, $rapFiles.Count) -ForegroundColor DarkGray
 
         if ($pkgFiles.Count -eq 0) {
-            Write-StatusLine -Icon '✖' -Color Red -Label 'NO PKG' -Detail $dispName
+            Write-StatusLine -Icon '[FAIL]' -Color Red -Label 'NO PKG' -Detail $dispName
             $counters.Failed++
             $failedItems.Add([pscustomobject] @{ Name = $dispName; Reason = 'No PKG file found'; Exit = 'N/A' })
             Write-LogRow -ArchivePath $sourcePath -PkgPath '' -RapPath '' -Status 'Failed' `
@@ -776,7 +782,7 @@ foreach ($item in $workItems) {
             foreach ($pkg in $pkgFiles) {
                 $rap     = Get-MatchingRap -Pkg $pkg -Raps $rapFiles
                 $rapNote = $rap ? "RAP: $($rap.Name)" : 'No RAP'
-                Write-StatusLine -Icon '🔍' -Color DarkCyan -Label 'DRY RUN' `
+                Write-StatusLine -Icon '[SCAN]' -Color DarkCyan -Label 'DRY RUN' `
                     -Detail "$($pkg.Name)  [$rapNote]"
                 Write-LogRow -ArchivePath $sourcePath -PkgPath $pkg.FullName `
                     -RapPath ($rap?.FullName ?? '') `
@@ -805,7 +811,7 @@ foreach ($item in $workItems) {
                 $destHash = Get-FileHashSafe -Path $rapDestPath
                 if ($srcHash -ne $destHash) { throw "RAP hash mismatch after copy: $($rap.Name)" }
 
-                Write-Host ("    RAP      : {0}  ✔ verified" -f $rap.Name) -ForegroundColor DarkGreen
+                Write-Host ("    RAP      : {0}  [verified]" -f $rap.Name) -ForegroundColor DarkGreen
             } else {
                 Write-Host '    RAP      : none found (game may not need one)' -ForegroundColor DarkGray
             }
@@ -829,7 +835,7 @@ foreach ($item in $workItems) {
                 $folderNote = $detectedFolder `
                     ? [System.IO.Path]::GetFileName($detectedFolder) `
                     : 'DLC/Patch (existing folder updated)'
-                Write-StatusLine -Icon '✔' -Color Green -Label 'OK' `
+                Write-StatusLine -Icon '[OK]' -Color Green -Label 'OK' `
                     -Detail ('{0}  →  {1}' -f $pkg.Name, $folderNote)
                 Write-LogRow -ArchivePath $sourcePath -PkgPath $pkg.FullName `
                     -RapPath $rapDestPath -Status 'Success' -Details 'RPCS3 exit 0' `
@@ -837,7 +843,7 @@ foreach ($item in $workItems) {
             } else {
                 $itemSuccess = $false
                 $reason      = "RPCS3 exit code $exitCode"
-                Write-StatusLine -Icon '✖' -Color Red -Label 'FAILED' `
+                Write-StatusLine -Icon '[FAIL]' -Color Red -Label 'FAILED' `
                     -Detail ('{0}  —  {1}' -f $pkg.Name, $reason)
                 $failedItems.Add([pscustomobject] @{ Name = $dispName; Reason = $reason; Exit = $exitCode })
                 Write-LogRow -ArchivePath $sourcePath -PkgPath $pkg.FullName `
@@ -851,7 +857,7 @@ foreach ($item in $workItems) {
             $counters.Success++
             $movedTo = Move-ToFolder -Path $sourcePath -Destination $InstalledRoot
             if ($movedTo) {
-                Write-Host ("  📦 {0} moved  →  _Installed" -f ($isZip ? 'ZIP' : 'Folder')) `
+                Write-Host ("  [PKG] {0} moved  →  _Installed" -f ($isZip ? 'ZIP' : 'Folder')) `
                     -ForegroundColor DarkGreen
             }
             if ($itemHash) {
@@ -868,7 +874,7 @@ foreach ($item in $workItems) {
             $counters.Failed++
             if (Test-Path -LiteralPath $sourcePath) {
                 Move-ToFolder -Path $sourcePath -Destination $FailedRoot | Out-Null
-                Write-Host ("  📦 {0} moved  →  _Failed" -f ($isZip ? 'ZIP' : 'Folder')) `
+                Write-Host ("  [PKG] {0} moved  →  _Failed" -f ($isZip ? 'ZIP' : 'Folder')) `
                     -ForegroundColor DarkYellow
             }
         }
@@ -877,7 +883,7 @@ foreach ($item in $workItems) {
     }
     catch {
         $errMsg = $_.Exception.Message
-        Write-StatusLine -Icon '⚠' -Color Red -Label 'ERROR' -Detail ('{0}  —  {1}' -f $dispName, $errMsg)
+        Write-StatusLine -Icon '[!]' -Color Red -Label 'ERROR' -Detail ('{0}  —  {1}' -f $dispName, $errMsg)
         $counters.Error++
         $failedItems.Add([pscustomobject] @{ Name = $dispName; Reason = $errMsg; Exit = 'exception' })
         Write-LogRow -ArchivePath $sourcePath -PkgPath '' -RapPath '' -Status 'Error' `
@@ -885,33 +891,33 @@ foreach ($item in $workItems) {
 
         if (Test-Path -LiteralPath $sourcePath) {
             Move-ToFolder -Path $sourcePath -Destination $FailedRoot | Out-Null
-            Write-Host ("  📦 {0} moved  →  _Failed" -f ($isZip ? 'ZIP' : 'Folder')) `
+            Write-Host ("  [PKG] {0} moved  →  _Failed" -f ($isZip ? 'ZIP' : 'Folder')) `
                 -ForegroundColor DarkYellow
         }
         if ($needsCleanup) { Remove-FolderSafe -Path $workFolder }
     }
 }
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 #  SESSION SUMMARY
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 $totalFailed = $counters.Failed + $counters.Error
 
 Write-Host ''
 Write-Host ''
-Write-Host '╔══════════════════════════════════════════════════════╗' -ForegroundColor Cyan
-Write-Host '║                    SESSION SUMMARY                   ║' -ForegroundColor Cyan
-Write-Host '╚══════════════════════════════════════════════════════╝' -ForegroundColor Cyan
+Write-Host '======================================================' -ForegroundColor Cyan
+Write-Host '  SESSION SUMMARY' -ForegroundColor Cyan
+Write-Host '======================================================' -ForegroundColor Cyan
 Write-Host ''
 Write-Host ("  Total processed : {0}" -f $total)            -ForegroundColor White
-Write-Host ("  ✔  Succeeded    : {0}" -f $counters.Success) -ForegroundColor Green
-Write-Host ("  ⏭  Skipped      : {0}" -f $counters.Skipped) -ForegroundColor DarkGray
-Write-Host ("  ✖  Failed       : {0}" -f $totalFailed) `
+Write-Host ("  [OK] Succeeded   : {0}" -f $counters.Success) -ForegroundColor Green
+Write-Host ("  [--] Skipped     : {0}" -f $counters.Skipped) -ForegroundColor DarkGray
+Write-Host ("  [!!] Failed      : {0}" -f $totalFailed) `
     -ForegroundColor ($totalFailed -gt 0 ? 'Red' : 'Green')
 
 if ($failedItems.Count -gt 0) {
     Write-Host ''
-    Write-Host '  ── Failed Items ──────────────────────────────────────' -ForegroundColor Red
+    Write-Host '  -- Failed Items --------------------------------------' -ForegroundColor Red
     foreach ($fi in $failedItems) {
         Write-Host ("  • {0}"           -f $fi.Name)   -ForegroundColor Yellow
         Write-Host ("    Reason : {0}" -f $fi.Reason) -ForegroundColor Gray

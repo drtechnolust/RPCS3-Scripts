@@ -1,107 +1,92 @@
+#Requires -Version 5.1
 <#
-===============================================================================
-  SCRIPT   : Create-RPCS3-Shortcuts-HD-DISC.ps1
-  AUTHOR   : Paul Mardis
-  CREATED  : 2025
-  VERSION  : 1.0
-  GITHUB   : https://github.com/drtechnolust/RPCS3-Scripts
+.SYNOPSIS
+    Creates or updates Windows shortcuts for both PS3 HD/PSN and disc games in one run.
 
-===============================================================================
-  COPYRIGHT & LICENSE
-===============================================================================
-  Copyright (c) 2025 Paul Mardis. All rights reserved.
+.DESCRIPTION
+    Performs a two-pass scan of the PS3 library and creates .lnk shortcuts pointing
+    to RPCS3 with --no-gui for direct game launch. Both passes write to a single
+    shared shortcut folder with a shared de-duplication tracker.
 
-  This script is the original work of Paul Mardis and is provided for
-  personal, non-commercial use only.
+    Pass 1 -- HD/PSN games (dev_hdd0\game):
+      Title ID named folders, PARAM.SFO in root, EBOOT.BIN in USRDIR\
 
-  You MAY:
-    - Use this script for your own personal PS3/RPCS3 setup
-    - Share it with others provided this full header remains intact and
-      credit is clearly given to the original author: Paul Mardis
+    Pass 2 -- Disc games (dev_hdd0\disc):
+      Human-readable named folders, PARAM.SFO in PS3_GAME\, EBOOT.BIN in PS3_GAME\USRDIR\
 
-  You MAY NOT:
-    - Remove or alter this copyright notice or author attribution
-    - Redistribute this script as your own work
-    - Include this script in paid tools, packages, or products without
-      explicit written permission from Paul Mardis
-    - Claim authorship or creation of this script
+    Features:
+      - Parses PARAM.SFO binary metadata natively for accurate game titles
+      - Derives region tag from Title ID prefix (HD/PSN) or folder name (Disc)
+      - Shared de-duplication tracker prevents duplicate shortcuts across both passes
+      - Unicode-safe shortcut creation via GUID temp-file workaround
+      - Skips non-game folders (DATA, INSTALL, cache, hidden)
+      - Dry run mode previews all changes without writing anything
+      - CSV log records every decision made in both passes
 
-  If you share or repost this script anywhere (GitHub, Reddit, forums,
-  YouTube descriptions, Discord, etc.) you MUST credit:
-    Paul Mardis — https://github.com/drtechnolust
+.PARAMETER DryRun
+    When $true (default), shows what would be created without writing shortcuts.
+    Set to $false in the CONFIG block to apply changes.
 
-===============================================================================
-  DESCRIPTION
-===============================================================================
-  Scans BOTH PS3 game library folders in a single run and automatically creates
-  or updates Windows shortcuts (.lnk files) for each valid game, pointing to
-  RPCS3 with the --no-gui flag for seamless direct launch.
+.EXAMPLE
+    .\Create-RPCS3-Shortcuts-HD-DISC.ps1
 
-  Handles two distinct PS3 library structures:
-    HD/PSN Games  (dev_hdd0\game) — Title ID named folders, PARAM.SFO in root
-    Disc Games    (dev_hdd0\disc) — Human-readable folders, PARAM.SFO in PS3_GAME
+.NOTES
+    Region tag reference for HD/PSN Title ID prefixes:
+      BCUS/BLUS/NPUB/NPUA = US
+      BCES/BLES/NPEB/NPEA = EU
+      BCJS/BLJM/NPJB      = JP
+      BCAS/NPHA            = AS
+      NPKB                 = KR
 
-  Features:
-    - Two-pass scan: processes HD/PSN games then Disc games in one run
-    - Parses PARAM.SFO binary metadata for accurate game titles
-    - Derives region tags from Title ID prefixes (HD) and folder names (Disc)
-    - Shared de-duplication tracker prevents duplicate shortcuts across both sources
-    - Unicode-safe shortcut writing via temp-file workaround for WScript.Shell
-    - Skips non-game folders (DATA, INSTALL, cache, hidden)
-    - Dry run mode to safely preview all changes before committing
-    - Detailed per-library issue tracking in summary report
-  Designed for use with LaunchBox + RPCS3 on Windows.
+.VERSION
+    2.0.0 - Config block, DryRun default, CSV log, MIT license.
+             Replaced Read-Host DryRun prompt with config flag.
+    1.0.0 - Initial release. Two-pass scan, Unicode-safe shortcuts.
 
-===============================================================================
+.LICENSE
+    MIT License
+    Copyright (c) Paul Mardis
 #>
 
-param(
-    # HD/PSN games folder (Title ID named folders)
-    [string]$HdGamePath   = "D:\Arcade\System roms\Sony Playstation 3\dev_hdd0\game",
+# ==============================================================================
+# CONFIG -- Edit this block. Do not put paths anywhere else in this script.
+# ==============================================================================
+$HdGamePath   = "D:\Arcade\System roms\Sony Playstation 3\dev_hdd0\game"
+$DiscGamePath = "D:\Arcade\System roms\Sony Playstation 3\dev_hdd0\disc"
+$ShortcutPath = "D:\Arcade\System roms\Sony Playstation 3\games\shortcuts"
+$Rpcs3ExePath = "C:\Arcade\LaunchBox\Emulators\RPCS3\rpcs3.exe"
+$DryRun       = $true    # Set to $false to write shortcuts
+$LogDir       = Join-Path $ShortcutPath "Logs"
+# ==============================================================================
 
-    # Disc games folder (human-readable named folders)
-    [string]$DiscGamePath = "D:\Arcade\System roms\Sony Playstation 3\dev_hdd0\disc",
-
-    # Folder where all shortcuts will be created/updated
-    [string]$ShortcutPath = "D:\Arcade\System roms\Sony Playstation 3\games\shortcuts",
-
-    # Path to rpcs3.exe
-    [string]$Rpcs3ExePath = "C:\Arcade\LaunchBox\Emulators\RPCS3\rpcs3.exe"
-)
-
-# --------- Ask if this should be a dry run ----------
-$answer = Read-Host "Run as DRY RUN first so no changes are made? (Y/N, default Y)"
-$WhatIf = $true
-if ($answer -and $answer.Trim().ToUpper().StartsWith("N")) {
-    $WhatIf = $false
-}
-if ($WhatIf) {
-    Write-Host ">>> DRY RUN ENABLED - no shortcuts will actually be created/updated." -ForegroundColor Yellow
-} else {
-    Write-Host ">>> LIVE RUN - shortcuts will be created/updated." -ForegroundColor Green
+function Set-ExitCode {
+    param([int]$Code)
+    $global:LASTEXITCODE = $Code
 }
 
-if (-not (Test-Path $Rpcs3ExePath)) {
-    Write-Host "ERROR: rpcs3.exe not found at path:`n  $Rpcs3ExePath" -ForegroundColor Red
+# ------------------------------------------------------------------------------
+# Pre-flight
+# ------------------------------------------------------------------------------
+if (-not (Test-Path -LiteralPath $Rpcs3ExePath)) {
+    Write-Host "ERROR: rpcs3.exe not found: $Rpcs3ExePath" -ForegroundColor Red
+    Set-ExitCode 1
     return
 }
 
-# --------- Helper: parse PARAM.SFO (TITLE, TITLE_ID, CONTENT_ID) ----------
-function Get-SfoInfo {
-    param(
-        [Parameter(Mandatory)]
-        [string]$SfoPath
-    )
+# ------------------------------------------------------------------------------
+# Parse PARAM.SFO binary -- returns Title, TitleId, ContentId or $null
+# ------------------------------------------------------------------------------
+function Read-ParamSfo {
+    param([string]$SfoPath)
 
-    if (-not (Test-Path $SfoPath)) { return $null }
+    if (-not (Test-Path -LiteralPath $SfoPath)) { return $null }
 
-    $bytes = [System.IO.File]::ReadAllBytes($SfoPath)
+    try { $bytes = [System.IO.File]::ReadAllBytes($SfoPath) }
+    catch { return $null }
+
     if ($bytes.Length -lt 0x14) { return $null }
-
-    # Magic 00 50 53 46 ("\0PSF")
-    if ($bytes[0] -ne 0x00 -or $bytes[1] -ne 0x50 -or $bytes[2] -ne 0x53 -or $bytes[3] -ne 0x46) {
-        return $null
-    }
+    if ($bytes[0] -ne 0x00 -or $bytes[1] -ne 0x50 -or
+        $bytes[2] -ne 0x53 -or $bytes[3] -ne 0x46) { return $null }
 
     $keyTableOffset  = [BitConverter]::ToInt32($bytes, 8)
     $dataTableOffset = [BitConverter]::ToInt32($bytes, 12)
@@ -113,9 +98,9 @@ function Get-SfoInfo {
     for ($i = 0; $i -lt $indexEntries; $i++) {
         $keyOffset  = [BitConverter]::ToUInt16($bytes, $offset); $offset += 2
         $dataFmt    = [BitConverter]::ToUInt16($bytes, $offset); $offset += 2
-        $dataLen    = [BitConverter]::ToInt32($bytes, $offset);  $offset += 4
-        $dataMaxLen = [BitConverter]::ToInt32($bytes, $offset);  $offset += 4
-        $dataOffset = [BitConverter]::ToInt32($bytes, $offset);  $offset += 4
+        $dataLen    = [BitConverter]::ToInt32($bytes,  $offset); $offset += 4
+        $offset    += 4  # maxLen
+        $dataOffset = [BitConverter]::ToInt32($bytes,  $offset); $offset += 4
 
         $keyStart = $keyTableOffset + $keyOffset
         $k = $keyStart
@@ -126,7 +111,7 @@ function Get-SfoInfo {
             $dataStart = $dataTableOffset + $dataOffset
             if ($dataStart -lt 0 -or $dataStart -ge $bytes.Length) { continue }
 
-            $len = [Math]::Min($dataLen, $bytes.Length - $dataStart)
+            $len      = [Math]::Min($dataLen, $bytes.Length - $dataStart)
             $valBytes = New-Object byte[] $len
             [Array]::Copy($bytes, $dataStart, $valBytes, 0, $len)
 
@@ -136,27 +121,23 @@ function Get-SfoInfo {
             }
 
             if ($trimLen -gt 0) {
-                $value = [System.Text.Encoding]::UTF8.GetString($valBytes, 0, $trimLen)
-                $result[$keyName] = $value
+                $result[$keyName] = [System.Text.Encoding]::UTF8.GetString($valBytes, 0, $trimLen)
             }
         }
     }
 
     if (-not $result.ContainsKey("TITLE")) { return $null }
 
-    [PSCustomObject]@{
+    return [PSCustomObject]@{
         Title     = $result["TITLE"]
-        TitleId   = if ($result.ContainsKey("TITLE_ID"))   { $result["TITLE_ID"]   } else { $null }
+        TitleId   = if ($result.ContainsKey("TITLE_ID"))   { $result["TITLE_ID"] }   else { $null }
         ContentId = if ($result.ContainsKey("CONTENT_ID")) { $result["CONTENT_ID"] } else { $null }
     }
 }
 
-# --------- Helper: region from Title ID prefix (HD/PSN games) ----------
-# BCUS/BLUS/NPUB/NPUA = US
-# BCES/BLES/NPEB/NPEA = EU
-# BCJS/BLJM/NPJB      = JP
-# BCAS/NPHA           = AS
-# NPKB                = KR
+# ------------------------------------------------------------------------------
+# Region from Title ID prefix (HD/PSN games)
+# ------------------------------------------------------------------------------
 function Get-RegionFromTitleId {
     param([string]$TitleId)
 
@@ -164,56 +145,45 @@ function Get-RegionFromTitleId {
     $prefix = $TitleId.Substring(0, 4).ToUpper()
 
     switch ($prefix) {
-        "BCUS" { return "US" }
-        "BLUS" { return "US" }
-        "NPUB" { return "US" }
-        "NPUA" { return "US" }
-        "BCES" { return "EU" }
-        "BLES" { return "EU" }
-        "NPEB" { return "EU" }
-        "NPEA" { return "EU" }
-        "BCJS" { return "JP" }
-        "BLJM" { return "JP" }
-        "NPJB" { return "JP" }
-        "BCAS" { return "AS" }
-        "NPHA" { return "AS" }
-        "NPKB" { return "KR" }
-        default { return $null }
+        { $_ -in @("BCUS","BLUS","NPUB","NPUA") } { return "US" }
+        { $_ -in @("BCES","BLES","NPEB","NPEA") } { return "EU" }
+        { $_ -in @("BCJS","BLJM","NPJB") }        { return "JP" }
+        { $_ -in @("BCAS","NPHA") }               { return "AS" }
+        "NPKB"                                     { return "KR" }
+        default                                    { return $null }
     }
 }
 
-# --------- Helper: region from folder name suffix (disc games) ----------
-# Folder names end with _(USA), _(Japan), _(Europe), etc.
+# ------------------------------------------------------------------------------
+# Region from disc folder name suffix: (USA), (Europe), (Japan), etc.
+# ------------------------------------------------------------------------------
 function Get-RegionFromFolderName {
     param([string]$FolderName)
 
-    if ($FolderName -match '\(USA\)')     { return "US" }
-    if ($FolderName -match '\(Europe\)')  { return "EU" }
-    if ($FolderName -match '\(Japan\)')   { return "JP" }
-    if ($FolderName -match '\(Asia\)')    { return "AS" }
-    if ($FolderName -match '\(Korea\)')   { return "KR" }
-    if ($FolderName -match '\(China\)')   { return "CN" }
+    if ($FolderName -match '\(USA\)')    { return "US" }
+    if ($FolderName -match '\(Europe\)') { return "EU" }
+    if ($FolderName -match '\(Japan\)')  { return "JP" }
+    if ($FolderName -match '\(Asia\)')   { return "AS" }
+    if ($FolderName -match '\(Korea\)')  { return "KR" }
+    if ($FolderName -match '\(China\)')  { return "CN" }
     return $null
 }
 
-# --------- Helper: convert disc folder name to readable title ----------
-# e.g. "LEGO_Indiana_Jones_The_Original_Adventures_(USA)" -> "LEGO Indiana Jones The Original Adventures"
+# ------------------------------------------------------------------------------
+# Convert disc folder name to readable title
+# e.g. "LEGO_Indiana_Jones_(USA)" -> "LEGO Indiana Jones"
+# ------------------------------------------------------------------------------
 function Get-TitleFromFolderName {
     param([string]$FolderName)
-
-    # Strip trailing region tag e.g. _(USA), _(Japan)
     $title = $FolderName -replace '_\([^)]+\)$', ''
-
-    # Replace underscores with spaces
-    $title = $title -replace '_', ' '
-
-    return $title.Trim()
+    return ($title -replace '_', ' ').Trim()
 }
 
-# --------- Helper: skip non-game folders (HD/PSN library only) ----------
-function Test-IsSkippableFolder {
+# ------------------------------------------------------------------------------
+# Skip non-game folders in HD/PSN library
+# ------------------------------------------------------------------------------
+function Test-IsNonGameFolder {
     param([string]$FolderName)
-
     if ($FolderName -match "DATA$")    { return $true }
     if ($FolderName -match "INSTALL$") { return $true }
     if ($FolderName -match "_cache$")  { return $true }
@@ -222,11 +192,13 @@ function Test-IsSkippableFolder {
     return $false
 }
 
-# --------- Helper: strip invalid filename characters ----------
+# ------------------------------------------------------------------------------
+# Strip characters invalid in Windows filenames
+# ------------------------------------------------------------------------------
 function Get-CleanTitle {
     param([string]$Title)
 
-    $extraBad = [char[]]@([char]0xAE, [char]0x2122, [char]0xA9)  # ®, ™, ©
+    $extraBad = [char[]]@([char]0xAE, [char]0x2122, [char]0xA9)
     $invalid  = [System.IO.Path]::GetInvalidFileNameChars() + $extraBad
 
     foreach ($c in $invalid) {
@@ -236,7 +208,9 @@ function Get-CleanTitle {
     return $Title.Trim()
 }
 
-# --------- Helper: resolve a unique shortcut path ----------
+# ------------------------------------------------------------------------------
+# Resolve unique shortcut path -- avoids collisions, detects existing shortcuts
+# ------------------------------------------------------------------------------
 function Resolve-ShortcutPath {
     param(
         [string]$BaseName,
@@ -248,17 +222,15 @@ function Resolve-ShortcutPath {
     $counter   = 2
 
     while ($true) {
-        $lnkName = "$candidate.lnk"
-        $lnkPath = Join-Path $ShortcutFolder $lnkName
+        $lnkPath = Join-Path $ShortcutFolder "$candidate.lnk"
 
-        if (Test-Path $lnkPath) {
-            # Shortcut already exists on disk — update it
-            return [PSCustomObject]@{ Path = $lnkPath; Name = $lnkName; Existing = $true }
+        if (Test-Path -LiteralPath $lnkPath) {
+            return [PSCustomObject]@{ Path = $lnkPath; Name = "$candidate.lnk"; Existing = $true }
         }
 
         if (-not $UsedNames.Contains($candidate.ToLower())) {
             $UsedNames.Add($candidate.ToLower()) | Out-Null
-            return [PSCustomObject]@{ Path = $lnkPath; Name = $lnkName; Existing = $false }
+            return [PSCustomObject]@{ Path = $lnkPath; Name = "$candidate.lnk"; Existing = $false }
         }
 
         $candidate = "$BaseName ($counter)"
@@ -266,37 +238,33 @@ function Resolve-ShortcutPath {
     }
 }
 
-# --------- Helper: write shortcut or print dry-run preview ----------
-# WScript.Shell.CreateShortcut() fails to SAVE when the .lnk path contains Unicode
-# characters (Japanese, etc.) because it uses ANSI internally for the file path.
-# Workaround: save to a safe ASCII temp path first, then use .NET to move/rename
-# the file to the final Unicode path. The .lnk content itself is fine either way.
+# ------------------------------------------------------------------------------
+# Write shortcut using GUID temp-file pattern for Unicode safety.
+# WScript.Shell fails to save .lnk files whose path contains Unicode characters.
+# Fix: save to ASCII temp path, then use .NET File.Move() to the Unicode path.
+# ------------------------------------------------------------------------------
 function Write-Shortcut {
     param(
         [string]$ShortcutPath,
         [string]$ShortcutName,
         [bool]$Existing,
         [string]$TargetExe,
-        [string]$Arguments,
-        [bool]$WhatIf,
-        [System.Collections.ArrayList]$Created,
-        [System.Collections.ArrayList]$Updated
+        [string]$Arguments
     )
 
-    if ($WhatIf) {
+    if ($DryRun) {
         $action = if ($Existing) { "Would UPDATE" } else { "Would CREATE" }
         $color  = if ($Existing) { "Cyan" } else { "Green" }
-        Write-Host "[DRY RUN] $action`: $ShortcutName" -ForegroundColor $color
-        Write-Host "          Target   : $TargetExe"
-        Write-Host "          Arguments: $Arguments"
-        return
+        Write-Host ("  [{0}] {1}" -f $action, $ShortcutName) -ForegroundColor $color
+        Write-Host ("    Target : {0}" -f $TargetExe)
+        Write-Host ("    Args   : {0}" -f $Arguments)
+        return "dryrun"
     }
 
     try {
-        # Save to a unique ASCII temp path to avoid WScript.Shell Unicode bug
         $tempPath = [System.IO.Path]::Combine(
             [System.IO.Path]::GetTempPath(),
-            "_rpcs3_tmp_$([System.Guid]::NewGuid().ToString('N')).lnk"
+            ("_rpcs3_{0}.lnk" -f [System.Guid]::NewGuid().ToString("N"))
         )
 
         $wsh = New-Object -ComObject WScript.Shell
@@ -308,215 +276,284 @@ function Write-Shortcut {
         $sc.WindowStyle      = 1
         $sc.Save()
 
-        # Move from temp to final Unicode path using .NET (handles any filename)
-        if (Test-Path $ShortcutPath) {
+        if (Test-Path -LiteralPath $ShortcutPath) {
             [System.IO.File]::Delete($ShortcutPath)
         }
         [System.IO.File]::Move($tempPath, $ShortcutPath)
 
         if ($Existing) {
-            $Updated.Add($ShortcutPath) | Out-Null
-            Write-Host "Updated : $ShortcutName" -ForegroundColor Cyan
+            Write-Host ("  [Updated] {0}" -f $ShortcutName) -ForegroundColor Cyan
+            return "updated"
         } else {
-            $Created.Add($ShortcutPath) | Out-Null
-            Write-Host "Created : $ShortcutName" -ForegroundColor Green
+            Write-Host ("  [Created] {0}" -f $ShortcutName) -ForegroundColor Green
+            return "created"
         }
-    } catch {
-        Write-Host "ERROR saving shortcut: $ShortcutName" -ForegroundColor Red
-        Write-Host "  $_" -ForegroundColor DarkRed
+    }
+    catch {
+        Write-Host ("  [ERROR]   {0} -- {1}" -f $ShortcutName, $_.Exception.Message) -ForegroundColor Red
+        return "error"
     }
 }
 
-# --------- Shared state ----------
-if (-not (Test-Path $ShortcutPath)) {
-    if ($WhatIf) {
-        Write-Host "[DRY RUN] Would create shortcut folder: $ShortcutPath"
+# ==============================================================================
+# SETUP
+# ==============================================================================
+if (-not (Test-Path -LiteralPath $ShortcutPath)) {
+    if ($DryRun) {
+        Write-Host "[DRY RUN] Would create: $ShortcutPath" -ForegroundColor Yellow
     } else {
         New-Item -ItemType Directory -Path $ShortcutPath -Force | Out-Null
     }
 }
 
-$usedNames = New-Object System.Collections.Generic.HashSet[string]
+if (-not $DryRun -and -not (Test-Path -LiteralPath $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+}
 
-# Shared created/updated lists (both passes write to these)
-$created = [System.Collections.ArrayList]@()
-$updated = [System.Collections.ArrayList]@()
+$LogFile = Join-Path $LogDir ("Create-RPCS3-Shortcuts_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+$LogRows = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-# Per-library issue tracking
-$hdSkipped        = [System.Collections.ArrayList]@()
-$hdMissingSfo     = [System.Collections.ArrayList]@()
-$hdMissingEboot   = [System.Collections.ArrayList]@()
-$hdParseErrors    = [System.Collections.ArrayList]@()
+function Write-LogRow {
+    param(
+        [string]$Pass,
+        [string]$FolderName,
+        [string]$Title,
+        [string]$TitleId,
+        [string]$Region,
+        [string]$ShortcutName,
+        [string]$Action,
+        [string]$Status,
+        [string]$Note
+    )
+    $LogRows.Add([PSCustomObject]@{
+        Timestamp    = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        Pass         = $Pass
+        FolderName   = $FolderName
+        Title        = $Title
+        TitleId      = $TitleId
+        Region       = $Region
+        ShortcutName = $ShortcutName
+        Action       = $Action
+        Status       = $Status
+        Note         = $Note
+    })
+}
 
-$discMissingSfo   = [System.Collections.ArrayList]@()
-$discMissingEboot = [System.Collections.ArrayList]@()
-$discParseErrors  = [System.Collections.ArrayList]@()
+# Shared state across both passes
+$UsedNames = New-Object System.Collections.Generic.HashSet[string]
+$Counters  = @{ Created = 0; Updated = 0; Skipped = 0; Errors = 0 }
 
-# ===========================================================================
-# PASS 1 — HD/PSN Games (dev_hdd0\game)
-# Folder = Title ID | PARAM.SFO in root | EBOOT.BIN in USRDIR\
-# ===========================================================================
+# Per-pass issue tracking
+$HdSkipped        = [System.Collections.Generic.List[string]]::new()
+$HdMissingSfo     = [System.Collections.Generic.List[string]]::new()
+$HdMissingEboot   = [System.Collections.Generic.List[string]]::new()
+$HdParseErrors    = [System.Collections.Generic.List[string]]::new()
+$DiscMissingSfo   = [System.Collections.Generic.List[string]]::new()
+$DiscMissingEboot = [System.Collections.Generic.List[string]]::new()
+$DiscParseErrors  = [System.Collections.Generic.List[string]]::new()
+
+# ==============================================================================
+# BANNER
+# ==============================================================================
 Write-Host ""
-Write-Host "=========================================" -ForegroundColor White
-Write-Host " PASS 1: HD/PSN Games" -ForegroundColor White
-Write-Host " $HdGamePath" -ForegroundColor DarkGray
-Write-Host "=========================================" -ForegroundColor White
+Write-Host "Create-RPCS3-Shortcuts-HD-DISC" -ForegroundColor Cyan
+Write-Host "==============================" -ForegroundColor Cyan
+Write-Host "  HD/PSN  : $HdGamePath"
+Write-Host "  Disc    : $DiscGamePath"
+Write-Host "  Output  : $ShortcutPath"
+Write-Host "  RPCS3   : $Rpcs3ExePath"
+Write-Host "  DryRun  : $DryRun"
+Write-Host ""
+if ($DryRun) {
+    Write-Host "  [DRY RUN] No shortcuts will be written." -ForegroundColor Yellow
+    Write-Host ""
+}
+
+# ==============================================================================
+# PASS 1 -- HD/PSN Games (dev_hdd0\game)
+# ==============================================================================
+Write-Host "Pass 1: HD/PSN Games" -ForegroundColor White
+Write-Host "  $HdGamePath" -ForegroundColor DarkGray
 Write-Host ""
 
-if (-not (Test-Path $HdGamePath)) {
-    Write-Host "HD/PSN path not found - skipping: $HdGamePath" -ForegroundColor DarkYellow
+if (-not (Test-Path -LiteralPath $HdGamePath)) {
+    Write-Host "  Path not found -- skipping: $HdGamePath" -ForegroundColor Yellow
 } else {
-    Get-ChildItem -Path $HdGamePath -Directory | ForEach-Object {
-        $gameDir  = $_
-        $gamePath = $gameDir.FullName
+    $HdDirs = Get-ChildItem -LiteralPath $HdGamePath -Directory | Sort-Object Name
+    foreach ($GameDir in $HdDirs) {
+        $FolderName = $GameDir.Name
+        $GamePath   = $GameDir.FullName
 
-        if (Test-IsSkippableFolder -FolderName $gameDir.Name) {
-            $hdSkipped.Add($gamePath) | Out-Null
-            Write-Host "[$($gameDir.Name)] Skipped (non-game folder)" -ForegroundColor DarkGray
-            return
+        if (Test-IsNonGameFolder -FolderName $FolderName) {
+            $HdSkipped.Add($GamePath)
+            Write-Host ("  [SKIP] {0} (non-game folder)" -f $FolderName) -ForegroundColor DarkGray
+            Write-LogRow -Pass "HDD" -FolderName $FolderName -Action "Skip" -Status "NonGame" -Note "Non-game folder pattern"
+            continue
         }
 
-        $sfoPath = Join-Path $gamePath "PARAM.SFO"
-        if (-not (Test-Path $sfoPath)) {
-            $hdMissingSfo.Add($gamePath) | Out-Null
-            Write-Host "[$($gameDir.Name)] No PARAM.SFO found – SKIP" -ForegroundColor DarkYellow
-            return
+        $SfoPath = Join-Path $GamePath "PARAM.SFO"
+        if (-not (Test-Path -LiteralPath $SfoPath)) {
+            $HdMissingSfo.Add($GamePath)
+            Write-Host ("  [MISS] {0} -- no PARAM.SFO" -f $FolderName) -ForegroundColor DarkYellow
+            Write-LogRow -Pass "HDD" -FolderName $FolderName -Action "Skip" -Status "NoSFO" -Note "PARAM.SFO not found"
+            continue
         }
 
-        $info = Get-SfoInfo -SfoPath $sfoPath
-        if (-not $info) {
-            $hdParseErrors.Add($gamePath) | Out-Null
-            Write-Host "[$($gameDir.Name)] Could not read TITLE – SKIP" -ForegroundColor Red
-            return
+        $Info = Read-ParamSfo -SfoPath $SfoPath
+        if (-not $Info) {
+            $HdParseErrors.Add($GamePath)
+            Write-Host ("  [ERR]  {0} -- PARAM.SFO parse failed" -f $FolderName) -ForegroundColor Red
+            Write-LogRow -Pass "HDD" -FolderName $FolderName -Action "Skip" -Status "ParseError" -Note "Could not read TITLE"
+            continue
         }
 
-        $ebootPath = Join-Path $gamePath "USRDIR\EBOOT.BIN"
-        if (-not (Test-Path $ebootPath)) {
-            $hdMissingEboot.Add($gamePath) | Out-Null
-            Write-Host "[$($gameDir.Name)] No USRDIR\EBOOT.BIN found – SKIP" -ForegroundColor DarkYellow
-            return
+        $EbootPath = Join-Path $GamePath "USRDIR\EBOOT.BIN"
+        if (-not (Test-Path -LiteralPath $EbootPath)) {
+            $HdMissingEboot.Add($GamePath)
+            Write-Host ("  [MISS] {0} -- no USRDIR\EBOOT.BIN" -f $FolderName) -ForegroundColor DarkYellow
+            Write-LogRow -Pass "HDD" -FolderName $FolderName -TitleId $Info.TitleId -Title $Info.Title -Action "Skip" -Status "NoEBOOT" -Note "USRDIR\EBOOT.BIN not found"
+            continue
         }
 
-        $title = Get-CleanTitle -Title $info.Title
-        if (-not $title) {
-            $hdParseErrors.Add($gamePath) | Out-Null
-            Write-Host "[$($gameDir.Name)] Title empty after cleaning – SKIP" -ForegroundColor Red
-            return
+        $Title = Get-CleanTitle -Title $Info.Title
+        if (-not $Title) {
+            $HdParseErrors.Add($GamePath)
+            Write-Host ("  [ERR]  {0} -- title empty after cleaning" -f $FolderName) -ForegroundColor Red
+            Write-LogRow -Pass "HDD" -FolderName $FolderName -TitleId $Info.TitleId -Action "Skip" -Status "EmptyTitle"
+            continue
         }
 
-        $regionTag = Get-RegionFromTitleId -TitleId $info.TitleId
-        $baseName  = if ($regionTag) { "$title [$regionTag]" } else { $title }
-        $resolved  = Resolve-ShortcutPath -BaseName $baseName -ShortcutFolder $ShortcutPath -UsedNames $usedNames
+        $Region   = Get-RegionFromTitleId -TitleId $Info.TitleId
+        $BaseName = if ($Region) { "$Title [$Region]" } else { $Title }
+        $Resolved = Resolve-ShortcutPath -BaseName $BaseName -ShortcutFolder $ShortcutPath -UsedNames $UsedNames
 
-        Write-Shortcut `
-            -ShortcutPath $resolved.Path `
-            -ShortcutName $resolved.Name `
-            -Existing     $resolved.Existing `
-            -TargetExe    $Rpcs3ExePath `
-            -Arguments    "--no-gui `"$ebootPath`"" `
-            -WhatIf       $WhatIf `
-            -Created      $created `
-            -Updated      $updated
+        $Result = Write-Shortcut -ShortcutPath $Resolved.Path -ShortcutName $Resolved.Name `
+            -Existing $Resolved.Existing -TargetExe $Rpcs3ExePath `
+            -Arguments ("--no-gui `"{0}`"" -f $EbootPath)
+
+        Write-LogRow -Pass "HDD" -FolderName $FolderName -Title $Title -TitleId $Info.TitleId `
+            -Region $Region -ShortcutName $Resolved.Name -Action $(if ($Resolved.Existing) { "Update" } else { "Create" }) `
+            -Status $Result
+
+        switch ($Result) {
+            "created" { $Counters.Created++ }
+            "updated" { $Counters.Updated++ }
+            "dryrun"  { if ($Resolved.Existing) { $Counters.Updated++ } else { $Counters.Created++ } }
+            default   { $Counters.Errors++ }
+        }
     }
 }
 
-# ===========================================================================
-# PASS 2 — Disc Games (dev_hdd0\disc)
-# Folder = readable title with region | PARAM.SFO in PS3_GAME\ | EBOOT.BIN in PS3_GAME\USRDIR\
-# ===========================================================================
+# ==============================================================================
+# PASS 2 -- Disc Games (dev_hdd0\disc)
+# ==============================================================================
 Write-Host ""
-Write-Host "=========================================" -ForegroundColor White
-Write-Host " PASS 2: Disc Games" -ForegroundColor White
-Write-Host " $DiscGamePath" -ForegroundColor DarkGray
-Write-Host "=========================================" -ForegroundColor White
+Write-Host "Pass 2: Disc Games" -ForegroundColor White
+Write-Host "  $DiscGamePath" -ForegroundColor DarkGray
 Write-Host ""
 
-if (-not (Test-Path $DiscGamePath)) {
-    Write-Host "Disc path not found - skipping: $DiscGamePath" -ForegroundColor DarkYellow
+if (-not (Test-Path -LiteralPath $DiscGamePath)) {
+    Write-Host "  Path not found -- skipping: $DiscGamePath" -ForegroundColor Yellow
 } else {
-    Get-ChildItem -Path $DiscGamePath -Directory | ForEach-Object {
-        $gameDir  = $_
-        $gamePath = $gameDir.FullName
+    $DiscDirs = Get-ChildItem -LiteralPath $DiscGamePath -Directory | Sort-Object Name
+    foreach ($GameDir in $DiscDirs) {
+        $FolderName = $GameDir.Name
+        $GamePath   = $GameDir.FullName
 
-        $sfoPath = Join-Path $gamePath "PS3_GAME\PARAM.SFO"
-        if (-not (Test-Path $sfoPath)) {
-            $discMissingSfo.Add($gamePath) | Out-Null
-            Write-Host "[$($gameDir.Name)] No PS3_GAME\PARAM.SFO found – SKIP" -ForegroundColor DarkYellow
-            return
+        $SfoPath = Join-Path $GamePath "PS3_GAME\PARAM.SFO"
+        if (-not (Test-Path -LiteralPath $SfoPath)) {
+            $DiscMissingSfo.Add($GamePath)
+            Write-Host ("  [MISS] {0} -- no PS3_GAME\PARAM.SFO" -f $FolderName) -ForegroundColor DarkYellow
+            Write-LogRow -Pass "Disc" -FolderName $FolderName -Action "Skip" -Status "NoSFO" -Note "PS3_GAME\PARAM.SFO not found"
+            continue
         }
 
-        $info = Get-SfoInfo -SfoPath $sfoPath
-        if (-not $info) {
-            $discParseErrors.Add($gamePath) | Out-Null
-            Write-Host "[$($gameDir.Name)] Could not read TITLE – SKIP" -ForegroundColor Red
-            return
+        $Info = Read-ParamSfo -SfoPath $SfoPath
+        if (-not $Info) {
+            $DiscParseErrors.Add($GamePath)
+            Write-Host ("  [ERR]  {0} -- PARAM.SFO parse failed" -f $FolderName) -ForegroundColor Red
+            Write-LogRow -Pass "Disc" -FolderName $FolderName -Action "Skip" -Status "ParseError" -Note "Could not read TITLE"
+            continue
         }
 
-        $ebootPath = Join-Path $gamePath "PS3_GAME\USRDIR\EBOOT.BIN"
-        if (-not (Test-Path $ebootPath)) {
-            $discMissingEboot.Add($gamePath) | Out-Null
-            Write-Host "[$($gameDir.Name)] No PS3_GAME\USRDIR\EBOOT.BIN found – SKIP" -ForegroundColor DarkYellow
-            return
+        $EbootPath = Join-Path $GamePath "PS3_GAME\USRDIR\EBOOT.BIN"
+        if (-not (Test-Path -LiteralPath $EbootPath)) {
+            $DiscMissingEboot.Add($GamePath)
+            Write-Host ("  [MISS] {0} -- no PS3_GAME\USRDIR\EBOOT.BIN" -f $FolderName) -ForegroundColor DarkYellow
+            Write-LogRow -Pass "Disc" -FolderName $FolderName -TitleId $Info.TitleId -Title $Info.Title -Action "Skip" -Status "NoEBOOT"
+            continue
         }
 
         # Prefer PARAM.SFO title; fall back to cleaning the folder name
-        $rawTitle = if ($info.Title) { $info.Title } else { Get-TitleFromFolderName -FolderName $gameDir.Name }
-        $title    = Get-CleanTitle -Title $rawTitle
-        if (-not $title) {
-            $discParseErrors.Add($gamePath) | Out-Null
-            Write-Host "[$($gameDir.Name)] Title empty after cleaning – SKIP" -ForegroundColor Red
-            return
+        $RawTitle = if ($Info.Title) { $Info.Title } else { Get-TitleFromFolderName -FolderName $FolderName }
+        $Title    = Get-CleanTitle -Title $RawTitle
+        if (-not $Title) {
+            $DiscParseErrors.Add($GamePath)
+            Write-Host ("  [ERR]  {0} -- title empty after cleaning" -f $FolderName) -ForegroundColor Red
+            Write-LogRow -Pass "Disc" -FolderName $FolderName -TitleId $Info.TitleId -Action "Skip" -Status "EmptyTitle"
+            continue
         }
 
-        # Region: folder name first, fall back to Title ID from PARAM.SFO
-        $regionTag = Get-RegionFromFolderName -FolderName $gameDir.Name
-        if (-not $regionTag) {
-            $regionTag = Get-RegionFromTitleId -TitleId $info.TitleId
-        }
-        $baseName = if ($regionTag) { "$title [$regionTag]" } else { $title }
-        $resolved = Resolve-ShortcutPath -BaseName $baseName -ShortcutFolder $ShortcutPath -UsedNames $usedNames
+        # Region: folder name first, then Title ID
+        $Region   = Get-RegionFromFolderName -FolderName $FolderName
+        if (-not $Region) { $Region = Get-RegionFromTitleId -TitleId $Info.TitleId }
+        $BaseName = if ($Region) { "$Title [$Region]" } else { $Title }
+        $Resolved = Resolve-ShortcutPath -BaseName $BaseName -ShortcutFolder $ShortcutPath -UsedNames $UsedNames
 
-        Write-Shortcut `
-            -ShortcutPath $resolved.Path `
-            -ShortcutName $resolved.Name `
-            -Existing     $resolved.Existing `
-            -TargetExe    $Rpcs3ExePath `
-            -Arguments    "--no-gui `"$ebootPath`"" `
-            -WhatIf       $WhatIf `
-            -Created      $created `
-            -Updated      $updated
+        $Result = Write-Shortcut -ShortcutPath $Resolved.Path -ShortcutName $Resolved.Name `
+            -Existing $Resolved.Existing -TargetExe $Rpcs3ExePath `
+            -Arguments ("--no-gui `"{0}`"" -f $EbootPath)
+
+        Write-LogRow -Pass "Disc" -FolderName $FolderName -Title $Title -TitleId $Info.TitleId `
+            -Region $Region -ShortcutName $Resolved.Name -Action $(if ($Resolved.Existing) { "Update" } else { "Create" }) `
+            -Status $Result
+
+        switch ($Result) {
+            "created" { $Counters.Created++ }
+            "updated" { $Counters.Updated++ }
+            "dryrun"  { if ($Resolved.Existing) { $Counters.Updated++ } else { $Counters.Created++ } }
+            default   { $Counters.Errors++ }
+        }
     }
 }
 
-# --------- Summary ----------
-Write-Host ""
-Write-Host "================= SUMMARY =================" -ForegroundColor White
-Write-Host ""
-Write-Host "  OVERALL"
-Write-Host "    Shortcuts CREATED        : $($created.Count)"
-Write-Host "    Shortcuts UPDATED        : $($updated.Count)"
-Write-Host ""
-Write-Host "  HD/PSN GAMES (game\)"
-Write-Host "    Skipped (non-game)       : $($hdSkipped.Count)"
-Write-Host "    Missing PARAM.SFO        : $($hdMissingSfo.Count)"
-Write-Host "    Missing EBOOT.BIN        : $($hdMissingEboot.Count)"
-Write-Host "    Parse errors             : $($hdParseErrors.Count)"
-Write-Host ""
-Write-Host "  DISC GAMES (disc\)"
-Write-Host "    Missing PS3_GAME\PARAM.SFO   : $($discMissingSfo.Count)"
-Write-Host "    Missing PS3_GAME\EBOOT.BIN   : $($discMissingEboot.Count)"
-Write-Host "    Parse errors                 : $($discParseErrors.Count)"
-Write-Host ""
-Write-Host "===========================================" -ForegroundColor White
-
-[PSCustomObject]@{
-    Created          = $created
-    Updated          = $updated
-    HdSkipped        = $hdSkipped
-    HdMissingSfo     = $hdMissingSfo
-    HdMissingEboot   = $hdMissingEboot
-    HdParseErrors    = $hdParseErrors
-    DiscMissingSfo   = $discMissingSfo
-    DiscMissingEboot = $discMissingEboot
-    DiscParseErrors  = $discParseErrors
+# ==============================================================================
+# WRITE LOG
+# ==============================================================================
+if ($LogRows.Count -gt 0 -and -not $DryRun) {
+    try {
+        $LogRows | Export-Csv -LiteralPath $LogFile -NoTypeInformation -Encoding UTF8
+        Write-Host ""
+        Write-Host ("  Log: {0}" -f $LogFile) -ForegroundColor Gray
+    } catch {
+        Write-Host ("  WARNING: Could not write log -- {0}" -f $_) -ForegroundColor Yellow
+    }
 }
+
+# ==============================================================================
+# SUMMARY
+# ==============================================================================
+Write-Host ""
+Write-Host "Summary" -ForegroundColor White
+Write-Host ("  {0,-30} {1}" -f "Shortcuts created :", $Counters.Created) -ForegroundColor Green
+Write-Host ("  {0,-30} {1}" -f "Shortcuts updated :", $Counters.Updated) -ForegroundColor Cyan
+Write-Host ("  {0,-30} {1}" -f "Errors :", $Counters.Errors) -ForegroundColor $(if ($Counters.Errors -gt 0) { "Red" } else { "Gray" })
+Write-Host ""
+Write-Host "  HD/PSN Games" -ForegroundColor DarkGray
+Write-Host ("    {0,-28} {1}" -f "Skipped (non-game) :", $HdSkipped.Count)
+Write-Host ("    {0,-28} {1}" -f "Missing PARAM.SFO :", $HdMissingSfo.Count)
+Write-Host ("    {0,-28} {1}" -f "Missing EBOOT.BIN :", $HdMissingEboot.Count)
+Write-Host ("    {0,-28} {1}" -f "Parse errors :", $HdParseErrors.Count)
+Write-Host ""
+Write-Host "  Disc Games" -ForegroundColor DarkGray
+Write-Host ("    {0,-28} {1}" -f "Missing PS3_GAME\PARAM.SFO :", $DiscMissingSfo.Count)
+Write-Host ("    {0,-28} {1}" -f "Missing PS3_GAME\EBOOT.BIN :", $DiscMissingEboot.Count)
+Write-Host ("    {0,-28} {1}" -f "Parse errors :", $DiscParseErrors.Count)
+
+if ($DryRun) {
+    Write-Host ""
+    Write-Host "  DRY RUN complete. Set `$DryRun = `$false in the CONFIG block to apply." -ForegroundColor Yellow
+}
+
+Write-Host ""
+Set-ExitCode 0
